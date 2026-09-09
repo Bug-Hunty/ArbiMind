@@ -1,0 +1,36 @@
+name: Bot Tests
+
+on:
+  pull_request:
+    paths:
+      - 'packages/bot/**'
+  push:
+    branches: [main]
+    paths:
+      - 'packages/bot/**'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint bot code
+        run: pnpm --filter @arbimind/bot lint
+
+      - name: Run bot tests
+        run: pnpm --filter @arbimind/bot test:coverage
