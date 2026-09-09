@@ -1,0 +1,10 @@
+[phases.setup]
+cmds = ["corepack disable"]
+
+[phases.install]
+cmds = ["npm install"]
+[phases.build]
+cmds = ["npm run build --workspace=@arbimind/bot || npm run build"]
+
+[start]
+cmd = "npm run start --workspace=@arbimind/bot || npm run start"
