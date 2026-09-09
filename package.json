@@ -69,6 +69,6 @@
     "defu": "GHSA-737v-mqg7-c878 prototype pollution. Override from 6.1.4 via h3 > unstorage chain."
   },
   "dependencies": {
-    "protobufjs": "7.6.5"
+    "protobufjs": "8.8.0"
   }
 }
