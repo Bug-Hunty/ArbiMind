@@ -1,0 +1,44 @@
+'use client';
+
+import { PriceChart, type PricePoint } from './PriceChart';
+import { VolumeChart, type VolumePoint } from './VolumeChart';
+import { LiquidityGauge } from './LiquidityGauge';
+import { AlertsBadges } from './AlertsBadges';
+
+interface MetricsGridProps {
+  priceSeries: PricePoint[];
+  volumeSeries: VolumePoint[];
+  liquidityUsd: number;
+  priceUsd: number;
+  alerts?: { volumeSpike?: boolean; txSpike?: boolean };
+  isWatching?: boolean;
+  watchCount?: number;
+  onToggleWatch?: () => void;
+}
+
+export function MetricsGrid({ priceSeries, volumeSeries, liquidityUsd, priceUsd, alerts, isWatching, watchCount, onToggleWatch }: MetricsGridProps) {
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div className="text-xs text-dark-400">
+          {typeof watchCount === 'number' ? `Watching ${watchCount} pairs` : 'Watchlist inactive'}
+        </div>
+        {onToggleWatch && (
+          <button className="btn btn-ghost text-xs" type="button" onClick={onToggleWatch}>
+            {isWatching ? 'Unwatch' : 'Watch'}
+          </button>
+        )}
+      </div>
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <div className="lg:col-span-2">
+        <PriceChart data={priceSeries} />
+      </div>
+      <LiquidityGauge liquidityUsd={liquidityUsd} priceUsd={priceUsd} />
+      <div className="lg:col-span-2">
+        <VolumeChart data={volumeSeries} />
+      </div>
+      <AlertsBadges alerts={alerts} />
+      </div>
+    </div>
+  );
+}

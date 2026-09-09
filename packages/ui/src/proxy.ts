@@ -1,0 +1,107 @@
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
+
+export function proxy(req: NextRequest) {
+  const res = NextResponse.next();
+
+  try {
+    const isDev = process.env.NODE_ENV === 'development';
+    const isPlaywright = process.env.PLAYWRIGHT === '1';
+
+    // Skip CSP in dev and when running Playwright E2E (avoids eval blocking wallet adapters).
+    if (isDev || isPlaywright) return res;
+
+    const reportOnly = process.env.CSP_REPORT_ONLY === 'true';
+    const isLocalhost = req.nextUrl.hostname === 'localhost' || req.nextUrl.hostname === '127.0.0.1';
+
+    // Build connect-src: include API origin from NEXT_PUBLIC_API_URL (e.g. http://localhost:8001)
+    const raw = (process.env.NEXT_PUBLIC_API_URL || '').trim();
+    const secondHttp = raw ? raw.indexOf('http', raw.indexOf('http') + 5) : -1;
+    const apiUrl = secondHttp !== -1 ? raw.substring(0, secondHttp) : raw;
+    let apiOrigins = '';
+    if (apiUrl) {
+      try {
+        const u = new URL(apiUrl);
+        apiOrigins = ` ${u.origin} ${u.origin.replace(/^http/, 'ws')}`;
+      } catch {
+        /* ignore invalid URL */
+      }
+    }
+
+    const toOrigin = (value: string | undefined) => {
+      const v = (value || '').trim();
+      if (!v) return '';
+      try {
+        return new URL(v).origin;
+      } catch {
+        return '';
+      }
+    };
+
+    const rpcOrigins = [
+      toOrigin(process.env.NEXT_PUBLIC_POLYGON_RPC_URL),
+      toOrigin(process.env.NEXT_PUBLIC_POLYGON_RPC),
+      toOrigin(process.env.NEXT_PUBLIC_AMOY_RPC_URL),
+      toOrigin(process.env.NEXT_PUBLIC_POLYGON_AMOY_RPC_URL),
+      toOrigin(process.env.NEXT_PUBLIC_POLYGON_AMOY_RPC),
+      toOrigin(process.env.NEXT_PUBLIC_SOLANA_RPC_URL),
+      'https://polygon-rpc.com',
+      'https://rpc-amoy.polygon.technology',
+      'https://*.publicnode.com',
+      'https://api.devnet.solana.com',
+      'https://api.mainnet-beta.solana.com',
+      'https://api.testnet.solana.com',
+      'https://*.alchemy.com',
+      'https://*.helius-rpc.com',
+    ].filter(Boolean);
+
+    const rpcConnectSrc = Array.from(new Set(rpcOrigins)).join(' ');
+    const metamaskConnectSrc = 'https://*.metamask.io https://metamask-sdk.api.cx.metamask.io https://mm-sdk-analytics.api.cx.metamask.io';
+    const localBackend = isLocalhost
+      ? `http://localhost:8000 ws://localhost:8000 http://localhost:8001 ws://localhost:8001 http://127.0.0.1:8000 ws://127.0.0.1:8000 http://127.0.0.1:8001 ws://127.0.0.1:8001${apiOrigins}`
+      : apiOrigins;
+
+    const prodStrict = [
+      `default-src 'self'`,
+      `script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' 'unsafe-eval'`,
+      `style-src 'self' 'unsafe-inline' https://fonts.googleapis.com`,
+      `font-src 'self' data: https://fonts.gstatic.com`,
+      `img-src 'self' blob: data: https:`,
+      `connect-src 'self' ${localBackend} ${rpcConnectSrc} ${metamaskConnectSrc} https://api.dexscreener.com https://api.web3modal.org https://pulse.walletconnect.org https://rpc.walletconnect.com https://relay.walletconnect.com https://rpc.walletconnect.org https://relay.walletconnect.org https://cloud.walletconnect.com ws: wss:`.trim(),
+      `frame-src 'self' https://*.walletconnect.org https://*.reown.com`,
+      `worker-src 'self' blob:`,
+      `base-uri 'self'`,
+      `form-action 'self'`,
+    ].join('; ');
+
+    const reportOnlyPolicy = [
+      `default-src 'self'`,
+      `script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' 'unsafe-eval' https://vercel.live`,
+      `style-src 'self' 'unsafe-inline' https://fonts.googleapis.com`,
+      `font-src 'self' data: https://fonts.gstatic.com`,
+      `img-src 'self' blob: data: https:`,
+      `connect-src 'self' ${localBackend} ${rpcConnectSrc} ${metamaskConnectSrc} https://api.dexscreener.com https://api.web3modal.org https://pulse.walletconnect.org https://rpc.walletconnect.com https://relay.walletconnect.com https://rpc.walletconnect.org https://relay.walletconnect.org https://cloud.walletconnect.com ws: wss:`.trim(),
+      `frame-src 'self' https://*.walletconnect.org https://*.reown.com https://vercel.live`,
+      `worker-src 'self' blob:`,
+      `base-uri 'self'`,
+      `form-action 'self'`,
+    ].join('; ');
+
+    if (reportOnly) {
+      res.headers.set('Content-Security-Policy-Report-Only', reportOnlyPolicy);
+    } else {
+      res.headers.set('Content-Security-Policy', prodStrict);
+    }
+
+    return res;
+  } catch (e) {
+    console.error('CSP proxy error', e);
+    return res;
+  }
+}
+
+export const config = {
+  // Exclude Next static assets to avoid ChunkLoadError (middleware must not touch chunk requests)
+  matcher: ['/((?!_next/static|_next/image|api|favicon\\.ico|robots\\.txt|sitemap\\.xml|\\.well-known).*)'],
+};
+

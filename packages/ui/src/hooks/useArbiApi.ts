@@ -1,0 +1,628 @@
+/**
+ * ArbiMind API hook for fetching data and executing actions
+ * Falls back to mock data if backend is unavailable
+ */
+
+import { useState, useEffect, useCallback } from 'react';
+import { apiUrl } from '@/lib/apiConfig';
+// Disable API calls by default - set to true when backend is ready
+const ENABLE_API_CALLS = process.env.NEXT_PUBLIC_ENABLE_API === 'true';
+// Enable public metrics/strategies only when backend exposes endpoints.
+const ENABLE_PUBLIC_METRICS = process.env.NEXT_PUBLIC_PUBLIC_METRICS === 'true';
+// Gate engine-mutating actions (start/stop/scan). When false, the UI
+// can still read engine status but cannot POST to engine endpoints.
+const ENABLE_ENGINE_UI = process.env.NEXT_PUBLIC_SIM_ENGINE_UI === 'true';
+
+// Types
+export interface HealthStatus {
+  status: 'ok' | 'degraded' | 'down';
+  message: string;
+  uptime?: number;
+}
+
+export interface Metrics {
+  profitEth: number;
+  profitUsd: number;
+  successRate: number;
+  totalTrades: number;
+  gasUsed: number;
+  latencyMs: number;
+  pnl24h: number[];
+  timestamp: number[];
+}
+
+export interface Strategy {
+  id: string;
+  name: string;
+  allocationBps: number; // basis points (0-10000)
+  lastPnl: number;
+  status: 'active' | 'paused' | 'error';
+  active: boolean;
+  successRate?: number; // 0-100
+  sentiment?: number; // 0-1
+}
+
+export interface Opportunity {
+  id: string;
+  pair: string;
+  fromDex: string;
+  toDex: string;
+  profitPct: number;
+  profitEth: number;
+  gasEst: number;
+  netGain: number;
+  timestamp: number;
+}
+
+export interface ExecuteResponse {
+  ok: boolean;
+  txHash?: string;
+  pnl?: number;
+  error?: string;
+}
+
+// Mock data fallbacks
+const mockHealth: HealthStatus = {
+  status: 'ok',
+  message: 'All systems operational',
+  uptime: 86400,
+};
+
+function normalizeHealth(raw: unknown): HealthStatus {
+  if (!raw || typeof raw !== 'object') return mockHealth;
+
+  const value = raw as Record<string, unknown>;
+  const rawStatus = typeof value.status === 'string' ? value.status.toLowerCase() : '';
+  const message = typeof value.message === 'string' ? value.message : '';
+  const uptime = typeof value.uptime === 'number' ? value.uptime : undefined;
+
+  if (rawStatus === 'ok' || rawStatus === 'degraded' || rawStatus === 'down') {
+    return {
+      status: rawStatus,
+      message: message || (rawStatus === 'ok' ? 'All systems operational' : 'System status reported'),
+      ...(uptime !== undefined ? { uptime } : {}),
+    };
+  }
+
+  if (rawStatus === 'healthy') {
+    return {
+      status: 'ok',
+      message: message || 'All systems operational',
+      ...(uptime !== undefined ? { uptime } : {}),
+    };
+  }
+
+  if (rawStatus === 'unhealthy' || rawStatus === 'not_ready' || value.success === false) {
+    return {
+      status: 'down',
+      message: message || 'Service unavailable',
+      ...(uptime !== undefined ? { uptime } : {}),
+    };
+  }
+
+  if (value.success === true) {
+    return {
+      status: 'ok',
+      message: message || 'All systems operational',
+      ...(uptime !== undefined ? { uptime } : {}),
+    };
+  }
+
+  return mockHealth;
+}
+
+const mockMetrics: Metrics = {
+  profitEth: 2.456,
+  profitUsd: 5432.12,
+  successRate: 87.5,
+  totalTrades: 1247,
+  gasUsed: 0.0234,
+  latencyMs: 145,
+  pnl24h: [0, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6],
+  timestamp: Array.from({ length: 12 }, (_, i) => Date.now() - (11 - i) * 3600000),
+};
+
+const mockStrategies: Strategy[] = [
+  {
+    id: 'arbitrage',
+    name: 'Arbitrage',
+    allocationBps: 5000,
+    lastPnl: 0.0234,
+    status: 'active',
+    active: true,
+    successRate: 85,
+    sentiment: 0.8,
+  },
+  {
+    id: 'trend',
+    name: 'Trend Following',
+    allocationBps: 3000,
+    lastPnl: 0.0156,
+    status: 'active',
+    active: true,
+    successRate: 72,
+    sentiment: 0.6,
+  },
+  {
+    id: 'market-making',
+    name: 'Market Making',
+    allocationBps: 2000,
+    lastPnl: -0.0023,
+    status: 'paused',
+    active: false,
+    successRate: 92,
+    sentiment: 0.9,
+  },
+];
+
+const mockOpportunities: Opportunity[] = [
+  {
+    id: '1',
+    pair: 'ETH/USDC',
+    fromDex: 'Uniswap V3',
+    toDex: 'SushiSwap',
+    profitPct: 0.45,
+    profitEth: 0.0012,
+    gasEst: 0.0008,
+    netGain: 0.0004,
+    timestamp: Date.now() - 30000,
+  },
+  {
+    id: '2',
+    pair: 'WBTC/ETH',
+    fromDex: 'Curve',
+    toDex: 'Balancer',
+    profitPct: 0.32,
+    profitEth: 0.0009,
+    gasEst: 0.0006,
+    netGain: 0.0003,
+    timestamp: Date.now() - 60000,
+  },
+];
+
+// Helper to fetch with fallback
+async function fetchWithFallback<T>(
+  endpoint: string,
+  mockData: T,
+  options?: RequestInit
+): Promise<{ data: T; shouldRetry: boolean }> {
+  // If API calls are disabled, just return mock data
+  if (!ENABLE_API_CALLS) {
+    return { data: mockData, shouldRetry: false };
+  }
+
+  try {
+    const response = await fetch(apiUrl(endpoint.startsWith('/') ? endpoint : `/${endpoint}`), {
+      ...options,
+      headers: {
+        'Content-Type': 'application/json',
+        ...options?.headers,
+      },
+    });
+    
+    if (response.ok) {
+      return { data: await response.json(), shouldRetry: true };
+    }
+    
+    // If rate limited (429), don't retry for a long time
+    if (response.status === 429) {
+      return { data: mockData, shouldRetry: false };
+    }
+    
+    // Fall back to mock data on 404 or other errors
+    if (response.status === 404) {
+      return { data: mockData, shouldRetry: false };
+    }
+    return { data: mockData, shouldRetry: true };
+  } catch {
+    // Network errors - use mock data, but don't spam retries
+    return { data: mockData, shouldRetry: false };
+  }
+}
+
+// Hooks
+export function useHealth() {
+  const [health, setHealth] = useState<HealthStatus>(mockHealth);
+  const [loading, setLoading] = useState(false);
+  const [latencyMs, setLatencyMs] = useState(0);
+
+  useEffect(() => {
+    if (!ENABLE_API_CALLS) {
+      // If API disabled, just use mock data
+      return;
+    }
+
+    let intervalId: NodeJS.Timeout | null = null;
+    let timeoutId: NodeJS.Timeout | null = null;
+    let isMounted = true;
+
+    const fetchHealth = async () => {
+      if (!isMounted) return;
+      
+      setLoading(true);
+      const t0 = Date.now();
+      const { data, shouldRetry } = await fetchWithFallback('/health', mockHealth);
+      
+      if (!isMounted) return;
+      
+      setLatencyMs(Date.now() - t0);
+      setHealth(normalizeHealth(data));
+      setLoading(false);
+
+      // Clear any existing intervals/timeouts
+      if (intervalId) clearInterval(intervalId);
+      if (timeoutId) clearTimeout(timeoutId);
+
+      if (shouldRetry) {
+        // Normal polling - every 60s (slower to avoid rate limits)
+        intervalId = setInterval(fetchHealth, 60000);
+      } else {
+        // Rate limited or disabled - wait 5 minutes before retrying
+        timeoutId = setTimeout(fetchHealth, 300000);
+      }
+    };
+
+    // Delay initial fetch to avoid all hooks firing at once
+    const initialTimeout = setTimeout(fetchHealth, 1000);
+    
+    return () => {
+      isMounted = false;
+      clearTimeout(initialTimeout);
+      if (intervalId) clearInterval(intervalId);
+      if (timeoutId) clearTimeout(timeoutId);
+    };
+  }, []);
+
+  return { health, loading, latencyMs };
+}
+
+export function useMetrics() {
+  const [metrics, setMetrics] = useState<Metrics>(mockMetrics);
+  const [loading, setLoading] = useState(false);
+  const isDemo = !ENABLE_API_CALLS || !ENABLE_PUBLIC_METRICS;
+
+  useEffect(() => {
+    if (!ENABLE_API_CALLS || !ENABLE_PUBLIC_METRICS) {
+      return;
+    }
+
+    let intervalId: NodeJS.Timeout | null = null;
+    let timeoutId: NodeJS.Timeout | null = null;
+    let isMounted = true;
+
+    const fetchMetrics = async () => {
+      if (!isMounted) return;
+      
+      setLoading(true);
+      const { data, shouldRetry } = await fetchWithFallback('/metrics', mockMetrics);
+      
+      if (!isMounted) return;
+      
+      setMetrics(data);
+      setLoading(false);
+
+      if (intervalId) clearInterval(intervalId);
+      if (timeoutId) clearTimeout(timeoutId);
+
+      if (shouldRetry) {
+        intervalId = setInterval(fetchMetrics, 60000);
+      } else {
+        timeoutId = setTimeout(fetchMetrics, 300000);
+      }
+    };
+
+    // Stagger initial requests - metrics after 2s
+    const initialTimeout = setTimeout(fetchMetrics, 2000);
+    
+    return () => {
+      isMounted = false;
+      clearTimeout(initialTimeout);
+      if (intervalId) clearInterval(intervalId);
+      if (timeoutId) clearTimeout(timeoutId);
+    };
+  }, []);
+
+  return { metrics, loading, isDemo };
+}
+
+export function useStrategies() {
+  const [strategies, setStrategies] = useState<Strategy[]>(mockStrategies);
+  const [loading, setLoading] = useState(false);
+  const isDemo = !ENABLE_API_CALLS || !ENABLE_PUBLIC_METRICS;
+
+  useEffect(() => {
+    if (!ENABLE_API_CALLS || !ENABLE_PUBLIC_METRICS) {
+      return;
+    }
+
+    let intervalId: NodeJS.Timeout | null = null;
+    let timeoutId: NodeJS.Timeout | null = null;
+    let isMounted = true;
+
+    const fetchStrategies = async () => {
+      if (!isMounted) return;
+      
+      setLoading(true);
+      const { data, shouldRetry } = await fetchWithFallback('/strategies', mockStrategies);
+      
+      if (!isMounted) return;
+      
+      setStrategies(Array.isArray(data) ? data : mockStrategies);
+      setLoading(false);
+
+      if (intervalId) clearInterval(intervalId);
+      if (timeoutId) clearTimeout(timeoutId);
+
+      if (shouldRetry) {
+        intervalId = setInterval(fetchStrategies, 60000);
+      } else {
+        timeoutId = setTimeout(fetchStrategies, 300000);
+      }
+    };
+
+    // Stagger initial requests - strategies after 3s
+    const initialTimeout = setTimeout(fetchStrategies, 3000);
+    
+    return () => {
+      isMounted = false;
+      clearTimeout(initialTimeout);
+      if (intervalId) clearInterval(intervalId);
+      if (timeoutId) clearTimeout(timeoutId);
+    };
+  }, []);
+
+  return { strategies, loading, isDemo };
+}
+
+export function useOpportunities() {
+  const [opportunities, setOpportunities] = useState<Opportunity[]>(mockOpportunities);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    let intervalId: NodeJS.Timeout | null = null;
+    let isMounted = true;
+
+    const fetchOpportunities = async () => {
+      if (!isMounted) return;
+      
+      setLoading(true);
+      const res = await fetch(apiUrl('/opportunities')).catch(() => null);
+      const raw = res?.ok ? await res.json().catch(() => null) : null;
+      const data = Array.isArray(raw) ? raw : raw?.data;
+      
+      if (!isMounted) return;
+      
+      setOpportunities(Array.isArray(data) ? data : mockOpportunities);
+      setLoading(false);
+
+      if (intervalId) clearInterval(intervalId);
+      intervalId = setInterval(fetchOpportunities, 30000); // Poll every 30s
+    };
+
+    const initialTimeout = setTimeout(fetchOpportunities, 2000);
+    
+    return () => {
+      isMounted = false;
+      clearTimeout(initialTimeout);
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, []);
+
+  return { opportunities, loading };
+}
+
+export type EngineStatus = 'idle' | 'starting' | 'running' | 'blocked' | 'error';
+
+export function useEngine() {
+  const [isRunning, setIsRunning] = useState(false);
+  const [activeStrategy, setActiveStrategy] = useState<string>('');
+  const [activeWalletChain, setActiveWalletChain] = useState<'evm' | 'solana' | ''>('');
+  const [activeWalletAddress, setActiveWalletAddress] = useState<string>('');
+  const [loading, setLoading] = useState(false);
+  const [engineStatus, setEngineStatus] = useState<EngineStatus>('idle');
+  const [engineError, setEngineError] = useState<string>('');
+
+  const getLocalWalletContext = useCallback(() => {
+    if (typeof window === 'undefined') {
+      return null;
+    }
+
+    const chain = window.localStorage.getItem('arbimind:wallet:activeChain');
+    if (chain === 'solana') {
+      const address = window.localStorage.getItem('arbimind:wallet:solanaAddress');
+      const connected = window.localStorage.getItem('arbimind:wallet:solanaConnected') === '1';
+
+      if (!connected || !address) {
+        return null;
+      }
+
+      return {
+        walletChain: 'solana' as const,
+        walletAddress: address,
+      };
+    }
+
+    if (chain === 'evm') {
+      const address = window.localStorage.getItem('arbimind:wallet:evmAddress');
+      if (!address) {
+        return null;
+      }
+
+      return {
+        walletChain: 'evm' as const,
+        walletAddress: address,
+      };
+    }
+
+    return null;
+  }, []);
+
+  const fetchStatus = useCallback(async () => {
+    if (!ENABLE_API_CALLS) return;
+    try {
+      const response = await fetch(apiUrl('/engine/status'));
+      if (response.ok) {
+        const data = await response.json();
+        const active = data?.active ?? '';
+        const walletChain = data?.walletChain;
+        const walletAddress = data?.walletAddress;
+        setActiveStrategy(typeof active === 'string' ? active : '');
+        setIsRunning(!!active);
+        setActiveWalletChain(walletChain === 'evm' || walletChain === 'solana' ? walletChain : '');
+        setActiveWalletAddress(typeof walletAddress === 'string' ? walletAddress : '');
+      }
+    } catch {
+      // Ignore - backend may be offline
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchStatus();
+    const interval = setInterval(fetchStatus, 10000);
+    return () => clearInterval(interval);
+  }, [fetchStatus]);
+
+  const start = useCallback(async (strategy: string = 'arbitrage') => {
+    if (!ENABLE_ENGINE_UI) return;
+    setLoading(true);
+    setEngineStatus('starting');
+    setEngineError('');
+    try {
+      const referrer =
+        typeof window !== 'undefined' ? localStorage.getItem('arbimind_ref') : null;
+      const body: { strategy: string; referrer?: string; walletChain?: 'evm' | 'solana'; walletAddress?: string } = {
+        strategy,
+      };
+      if (referrer && /^0x[a-fA-F0-9]{40}$/.test(referrer)) body.referrer = referrer;
+      const walletContext = getLocalWalletContext();
+      if (walletContext) {
+        body.walletChain = walletContext.walletChain;
+        body.walletAddress = walletContext.walletAddress;
+      }
+      const response = await fetch(apiUrl('/engine/start'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (response.ok) {
+        const data = await response.json().catch(() => ({}));
+        const startedStrategy = typeof data?.strategy === 'string' ? data.strategy : strategy;
+        const walletChain = data?.walletChain;
+        const walletAddress = data?.walletAddress;
+        setActiveStrategy(startedStrategy);
+        setIsRunning(true);
+        setActiveWalletChain(walletChain === 'evm' || walletChain === 'solana' ? walletChain : '');
+        setActiveWalletAddress(typeof walletAddress === 'string' ? walletAddress : '');
+        setEngineStatus('running');
+        setEngineError('');
+      } else if (response.status === 403) {
+        setEngineStatus('blocked');
+        setEngineError('Simulated engine disabled in this environment');
+      } else {
+        setEngineStatus('error');
+        setEngineError(`Engine start failed (HTTP ${response.status})`);
+      }
+    } catch (error) {
+      setEngineStatus('error');
+      setEngineError(error instanceof Error ? error.message : 'Network error');
+      console.error('Failed to start engine:', error);
+    } finally {
+      setLoading(false);
+    }
+  }, [getLocalWalletContext]);
+
+  const stop = useCallback(async () => {
+    if (!ENABLE_ENGINE_UI) return;
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl('/engine/stop'), {
+        method: 'POST',
+      });
+      if (response.ok) {
+        setActiveStrategy('');
+        setIsRunning(false);
+        setActiveWalletChain('');
+        setActiveWalletAddress('');
+        setEngineStatus('idle');
+        setEngineError('');
+      }
+    } catch (error) {
+      console.error('Failed to stop engine:', error);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const singleScan = useCallback(async (strategy?: string) => {
+    if (!ENABLE_ENGINE_UI) return false;
+    try {
+      const response = await fetch(apiUrl('/engine/single-scan'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ strategy: strategy || activeStrategy || 'arbitrage' }),
+      });
+      return response.ok;
+    } catch (error) {
+      console.error('Single scan failed:', error);
+      return false;
+    }
+  }, [activeStrategy]);
+
+  const reloadPrices = useCallback(async () => {
+    if (!ENABLE_ENGINE_UI) return false;
+    try {
+      const response = await fetch(apiUrl('/engine/reload-prices'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      return response.ok;
+    } catch (error) {
+      console.error('Reload prices failed:', error);
+      return false;
+    }
+  }, []);
+
+  return {
+    isRunning,
+    activeStrategy,
+    activeWalletChain,
+    activeWalletAddress,
+    loading,
+    engineStatus,
+    engineError,
+    start,
+    stop,
+    singleScan,
+    reloadPrices,
+  };
+}
+
+export function useExecute() {
+  const [loading, setLoading] = useState(false);
+
+  const execute = useCallback(async (opportunityId: string): Promise<ExecuteResponse> => {
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl('/execute'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ opportunityId }),
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        return data;
+      } else {
+        return { ok: false, error: 'Execution failed' };
+      }
+    } catch (error) {
+      console.error('Failed to execute:', error);
+      return { ok: false, error: 'Network error' };
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  return { execute, loading };
+}
+

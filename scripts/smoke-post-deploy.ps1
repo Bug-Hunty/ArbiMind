@@ -1,0 +1,640 @@
+<#
+.SYNOPSIS
+  Post-deploy smoke test for ArbiMind backend/UI.
+.DESCRIPTION
+  Runs fast checks for health, RPC connectivity, snapshots, and optional admin/UI/portfolio checks.
+  When -UiBase is provided, also runs Playwright runtime UI smoke via pnpm.
+  Exits non-zero if required checks fail.
+
+.EXAMPLE
+  .\scripts\smoke-post-deploy.ps1 -BackendBase "https://arbimind-production.up.railway.app"
+
+.EXAMPLE
+  .\scripts\smoke-post-deploy.ps1 -BackendBase "https://arbimind-production.up.railway.app" -AdminKey "..." -UiBase "https://arbimind.vercel.app" -EvmAddress "0x..." -SolanaAddress "..."
+#>
+param(
+  [Parameter(Mandatory = $true)][string]$BackendBase,
+  [string]$AdminKey,
+  [string]$UiBase,
+  [string]$EvmAddress,
+  [string]$SolanaAddress,
+  [switch]$BotCanary,
+  [switch]$OnlyAnalytics,
+  [switch]$OnlyBotCanarySanity,
+  # Production smoke must not treat an unconfigured/unreachable database as a
+  # pass. Without this, a backend with no DATABASE_URL scores a full green run
+  # because every DB-backed check reports "skipped". Local/dev runs omit the
+  # switch and keep the intentional-skip behaviour.
+  [switch]$RequireDatabase,
+  [double]$CanaryNotionalEth = 0.01,
+  [double]$CanaryMaxDailyLossEth = 0.005,
+  [ValidateSet('evm,worldchain_sepolia,solana', 'evm,solana', 'worldchain_sepolia', 'evm', 'solana')]
+  [string]$RpcChains = 'evm,worldchain_sepolia,solana'
+)
+
+$ErrorActionPreference = 'Stop'
+
+# Fail fast on malformed endpoints. Callers that splat an ARRAY instead of a
+# hashtable bind positionally, which silently sets $BackendBase to the literal
+# string '-BackendBase' and surfaces later as a pile of DNS errors (#294).
+foreach ($endpoint in @(
+    @{ Name = 'BackendBase'; Value = $BackendBase }
+    @{ Name = 'UiBase'; Value = $UiBase }
+  )) {
+  $value = $endpoint.Value
+  if ([string]::IsNullOrWhiteSpace($value)) { continue }
+  if ($value -notmatch '^https?://') {
+    throw "-$($endpoint.Name) must be an absolute http(s) URL, got '$value'. If you are calling this script with splatting, use a hashtable (@{ BackendBase = '...' }) rather than an array."
+  }
+}
+
+$api = "$($BackendBase.TrimEnd('/'))/api"
+$results = New-Object System.Collections.Generic.List[object]
+$HttpTimeoutSeconds = 20
+$HttpMaxRetries = 2
+$TransientHttpStatusCodes = @(408, 429, 500, 502, 503, 504)
+
+function Get-HttpStatusCode {
+  param([object]$ErrorRecord)
+
+  if ($null -eq $ErrorRecord -or $null -eq $ErrorRecord.Exception) {
+    return $null
+  }
+
+  $response = $ErrorRecord.Exception.Response
+  if ($null -eq $response) {
+    return $null
+  }
+
+  if ($response.StatusCode) {
+    return [int]$response.StatusCode.value__
+  }
+
+  return $null
+}
+
+function Read-ErrorResponseBody {
+  <#
+    Reads the body off a failed response in a way that works on both editions.
+    Windows PowerShell 5.1 surfaces System.Net.HttpWebResponse (GetResponseStream),
+    while pwsh 7 surfaces System.Net.Http.HttpResponseMessage (Content.ReadAsStringAsync).
+    Calling GetResponseStream() under pwsh throws "does not contain a method named",
+    which masks the real status code and body. See #294.
+  #>
+  param([object]$Response)
+
+  if ($null -eq $Response) {
+    return $null
+  }
+
+  # pwsh 7 / HttpResponseMessage
+  if ($Response.PSObject.Properties['Content'] -and $Response.Content -and $Response.Content.PSObject.Methods['ReadAsStringAsync']) {
+    try {
+      return $Response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    }
+    catch {
+      return $null
+    }
+  }
+
+  # Windows PowerShell 5.1 / HttpWebResponse
+  if ($Response.PSObject.Methods['GetResponseStream']) {
+    try {
+      $stream = $Response.GetResponseStream()
+      if ($null -eq $stream) { return $null }
+      $reader = New-Object IO.StreamReader($stream)
+      try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
+    }
+    catch {
+      return $null
+    }
+  }
+
+  return $null
+}
+
+function Get-HttpErrorDetail {
+  <#
+    Builds a diagnosable one-line detail for a failed request: the original
+    message plus the real status code and a trimmed response body when available.
+  #>
+  param([object]$ErrorRecord)
+
+  $message = ''
+  if ($ErrorRecord -and $ErrorRecord.Exception) {
+    $message = $ErrorRecord.Exception.Message
+  }
+
+  $statusCode = Get-HttpStatusCode $ErrorRecord
+  if ($null -ne $statusCode) {
+    $message = "{0} (status={1})" -f $message, $statusCode
+  }
+
+  if ($ErrorRecord -and $ErrorRecord.Exception) {
+    $body = Read-ErrorResponseBody $ErrorRecord.Exception.Response
+    if (-not [string]::IsNullOrWhiteSpace($body)) {
+      $trimmed = $body.Trim()
+      if ($trimmed.Length -gt 300) { $trimmed = $trimmed.Substring(0, 300) + '...' }
+      $message = "{0} body={1}" -f $message, $trimmed
+    }
+  }
+
+  return ($message -replace "`r|`n", ' ')
+}
+
+function Invoke-SmokeHttpJson {
+  param(
+    [string]$CheckName,
+    [string]$Uri,
+    [string]$Method = 'Get',
+    [hashtable]$Headers,
+    [string]$Body,
+    [string]$ContentType,
+    [int]$TimeoutSeconds = $HttpTimeoutSeconds,
+    [int]$MaxRetries = $HttpMaxRetries
+  )
+
+  $attempt = 0
+  while ($attempt -le $MaxRetries) {
+    $attempt++
+    try {
+      $params = @{
+        Uri         = $Uri
+        Method      = $Method
+        ErrorAction = 'Stop'
+        TimeoutSec  = $TimeoutSeconds
+      }
+
+      if ($Headers) {
+        $params.Headers = $Headers
+      }
+      if ($Body) {
+        $params.Body = $Body
+      }
+      if ($ContentType) {
+        $params.ContentType = $ContentType
+      }
+
+      return Invoke-RestMethod @params
+    } catch {
+      $statusCode = Get-HttpStatusCode $_
+      $retryable = ($attempt -le $MaxRetries) -and (($null -eq $statusCode) -or ($TransientHttpStatusCodes -contains $statusCode))
+      if ($retryable) {
+        Write-Warning ("[{0}] transient request failure (attempt {1}/{2}) status={3} uri={4}" -f $CheckName, $attempt, ($MaxRetries + 1), (Coalesce $statusCode), $Uri)
+        continue
+      }
+      throw
+    }
+  }
+}
+
+function Invoke-SmokeHttpHead {
+  param(
+    [string]$CheckName,
+    [string]$Uri,
+    [int]$TimeoutSeconds = $HttpTimeoutSeconds,
+    [int]$MaxRetries = $HttpMaxRetries
+  )
+
+  $attempt = 0
+  while ($attempt -le $MaxRetries) {
+    $attempt++
+    try {
+      return Invoke-WebRequest -Uri $Uri -Method Head -ErrorAction Stop -TimeoutSec $TimeoutSeconds
+    } catch {
+      $statusCode = Get-HttpStatusCode $_
+      $retryable = ($attempt -le $MaxRetries) -and (($null -eq $statusCode) -or ($TransientHttpStatusCodes -contains $statusCode))
+      if ($retryable) {
+        Write-Warning ("[{0}] transient HEAD failure (attempt {1}/{2}) status={3} uri={4}" -f $CheckName, $attempt, ($MaxRetries + 1), (Coalesce $statusCode), $Uri)
+        continue
+      }
+      throw
+    }
+  }
+}
+
+function Coalesce {
+  param(
+    $Value,
+    [string]$Default = 'n/a'
+  )
+
+  if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+    return $Default
+  }
+
+  return [string]$Value
+}
+
+function Add-Result {
+  param(
+    [string]$Name,
+    [bool]$Ok,
+    [string]$Detail
+  )
+
+  $results.Add([pscustomobject]@{
+    Check  = $Name
+    Status = if ($Ok) { 'PASS' } else { 'FAIL' }
+    Detail = $Detail
+  }) | Out-Null
+}
+
+# Records a DB-backed check whose endpoint answered 503.
+#
+# In production (-RequireDatabase) that is a genuine failure: the backend cannot
+# serve the route. Locally it stays an intentional skip so contributors without a
+# database can still run the suite.
+function Add-DbUnavailableResult {
+  param(
+    [string]$Name,
+    [string]$Reason = 'DATABASE_URL not set'
+  )
+
+  if ($RequireDatabase) {
+    Add-Result -Name $Name -Ok $false -Detail ("database unavailable ({0}) - required by -RequireDatabase" -f $Reason)
+  }
+  else {
+    Add-Result -Name $Name -Ok $true -Detail ("skipped ({0})" -f $Reason)
+  }
+}
+
+function Invoke-Check {
+  param(
+    [string]$Name,
+    [scriptblock]$Block
+  )
+
+  try {
+    & $Block
+  } catch {
+    Add-Result -Name $Name -Ok $false -Detail (Get-HttpErrorDetail $_)
+  }
+}
+
+Write-Host "Running ArbiMind smoke checks against: $BackendBase" -ForegroundColor Cyan
+
+function Invoke-AnalyticsSmoke {
+  Invoke-Check -Name 'Analytics ingest + query' -Block {
+    try {
+      $marker = "smoke-analytics-" + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+      $payload = @{
+        name       = 'landing_view'
+        properties = @{ source = 'smoke'; marker = $marker }
+        ts         = (Get-Date).ToString('o')
+        path       = '/'
+        ctaVariant = 'A'
+        source     = 'smoke-script'
+      } | ConvertTo-Json -Depth 6
+
+      $post = Invoke-SmokeHttpJson -CheckName 'Analytics ingest + query' -Uri ("{0}/analytics/events" -f $api) -Method 'Post' -ContentType 'application/json' -Body $payload
+      if (-not $post.ok -or [string]::IsNullOrWhiteSpace([string]$post.id)) {
+        throw 'Analytics POST response missing ok/id'
+      }
+
+      $list = Invoke-SmokeHttpJson -CheckName 'Analytics ingest + query' -Uri ("{0}/analytics/events?limit=50" -f $api)
+      if (-not $list.ok -or $null -eq $list.events) {
+        throw 'Analytics GET response missing ok/events'
+      }
+
+      $found = $false
+      foreach ($evt in $list.events) {
+        $hasMarker = $false
+        if ($evt.properties -and $evt.properties.marker -eq $marker) {
+          $hasMarker = $true
+        }
+
+        if ($evt.id -eq $post.id -or $hasMarker) {
+          $found = $true
+          break
+        }
+      }
+
+      if (-not $found) {
+        throw 'Inserted analytics event not found in recent list'
+      }
+
+      Add-Result -Name 'Analytics ingest + query' -Ok $true -Detail ("eventId=" + $post.id)
+    } catch {
+      if ((Get-HttpStatusCode $_) -eq 503) {
+        Add-DbUnavailableResult -Name 'Analytics ingest + query'
+        return
+      }
+      throw
+    }
+  }
+
+  Invoke-Check -Name 'Analytics CTA A/B report' -Block {
+    try {
+      $report = Invoke-SmokeHttpJson -CheckName 'Analytics CTA A/B report' -Uri ("{0}/analytics/ab-cta?window=7d" -f $api)
+      if (-not $report.ok) {
+        throw 'A/B report response missing ok=true'
+      }
+      if ($null -eq $report.variants -or $report.variants.Count -lt 2) {
+        throw 'A/B report missing variants data'
+      }
+      Add-Result -Name 'Analytics CTA A/B report' -Ok $true -Detail ("winner=" + (Coalesce $report.winner 'tie'))
+    } catch {
+      if ((Get-HttpStatusCode $_) -eq 503) {
+        Add-DbUnavailableResult -Name 'Analytics CTA A/B report'
+        return
+      }
+      throw
+    }
+  }
+}
+
+if ($OnlyAnalytics) {
+  Invoke-AnalyticsSmoke
+
+  Write-Host "`nSmoke Summary" -ForegroundColor Cyan
+  $results | Format-Table -AutoSize
+
+  $fails = @($results | Where-Object { $_.Status -eq 'FAIL' }).Count
+  if ($fails -gt 0) {
+    Write-Host "`n$fails check(s) failed." -ForegroundColor Red
+    exit 1
+  }
+
+  Write-Host "`nAll smoke checks passed." -ForegroundColor Green
+  exit 0
+}
+
+if ($OnlyBotCanarySanity) {
+  if (-not $BotCanary) {
+    $BotCanary = $true
+  }
+
+  Invoke-Check -Name 'Bot canary config sanity' -Block {
+    if ($CanaryNotionalEth -le 0) {
+      throw 'CanaryNotionalEth must be > 0'
+    }
+    if ($CanaryMaxDailyLossEth -le 0) {
+      throw 'CanaryMaxDailyLossEth must be > 0'
+    }
+    if ($CanaryMaxDailyLossEth -ge $CanaryNotionalEth) {
+      throw 'CanaryMaxDailyLossEth should be lower than CanaryNotionalEth for safer rollout'
+    }
+
+    Add-Result -Name 'Bot canary config sanity' -Ok $true -Detail ("notional=" + $CanaryNotionalEth + ", maxLoss=" + $CanaryMaxDailyLossEth)
+  }
+
+  Write-Host "`nSmoke Summary" -ForegroundColor Cyan
+  $results | Format-Table -AutoSize
+
+  $fails = @($results | Where-Object { $_.Status -eq 'FAIL' }).Count
+  if ($fails -gt 0) {
+    Write-Host "`n$fails check(s) failed." -ForegroundColor Red
+    exit 1
+  }
+
+  Write-Host "`nAll smoke checks passed." -ForegroundColor Green
+  exit 0
+}
+
+Invoke-Check -Name 'API health' -Block {
+  $res = Invoke-SmokeHttpJson -CheckName 'API health' -Uri ("{0}/health" -f $api)
+  $ok = ($res.status -eq 'healthy' -or $res.success -eq $true -or $res.ok -eq $true)
+  Add-Result -Name 'API health' -Ok $ok -Detail ("status=" + (Coalesce $res.status))
+}
+
+Invoke-Check -Name 'RPC health' -Block {
+  try {
+    $res = Invoke-SmokeHttpJson -CheckName 'RPC health' -Uri ("{0}/rpc/health?chain={1}" -f $api, $RpcChains)
+    $ok = $res.ok -eq $true
+    $detail = if ($res.health) { ($res.health | ConvertTo-Json -Compress) } else { 'no-health-object' }
+    Add-Result -Name 'RPC health' -Ok $ok -Detail $detail
+  } catch {
+    if ($_.Exception.Response -and $_.Exception.Response.StatusCode.value__ -in @(503, 429)) {
+      $code = $_.Exception.Response.StatusCode.value__
+      Add-Result -Name 'RPC health' -Ok $true -Detail ("degraded ({0} - non-blocking)" -f $code)
+      return
+    }
+    throw
+  }
+}
+
+Invoke-AnalyticsSmoke
+
+Invoke-Check -Name 'Snapshots health (EVM)' -Block {
+  try {
+    $res = Invoke-SmokeHttpJson -CheckName 'Snapshots health (EVM)' -Uri ("{0}/snapshots/health?chain=evm" -f $api)
+    $ok = $res.ok -eq $true
+    Add-Result -Name 'Snapshots health (EVM)' -Ok $ok -Detail ("stale=" + (Coalesce $res.stale))
+  } catch {
+    if ((Get-HttpStatusCode $_) -eq 503) {
+      Add-DbUnavailableResult -Name 'Snapshots health (EVM)'
+      return
+    }
+    throw
+  }
+}
+
+Invoke-Check -Name 'Snapshots health (Solana)' -Block {
+  try {
+    $res = Invoke-SmokeHttpJson -CheckName 'Snapshots health (Solana)' -Uri ("{0}/snapshots/health?chain=solana" -f $api)
+    $ok = $res.ok -eq $true
+    Add-Result -Name 'Snapshots health (Solana)' -Ok $ok -Detail ("stale=" + (Coalesce $res.stale))
+  } catch {
+    if ((Get-HttpStatusCode $_) -eq 503) {
+      Add-DbUnavailableResult -Name 'Snapshots health (Solana)'
+      return
+    }
+    throw
+  }
+}
+
+if ($AdminKey) {
+  Invoke-Check -Name 'Admin snapshots last-run (EVM)' -Block {
+    try {
+      $headers = @{ 'X-ADMIN-KEY' = $AdminKey }
+      $res = Invoke-SmokeHttpJson -CheckName 'Admin snapshots last-run (EVM)' -Uri ("{0}/admin/snapshots/last-run?chain=evm" -f $api) -Headers $headers
+      Add-Result -Name 'Admin snapshots last-run (EVM)' -Ok $true -Detail ("ok=" + (Coalesce $res.ok))
+    } catch {
+      if ($_.Exception.Response -and $_.Exception.Response.StatusCode.value__ -eq 503) {
+        Add-Result -Name 'Admin snapshots last-run (EVM)' -Ok $true -Detail 'skipped (service unavailable)'
+        return
+      }
+      throw
+    }
+  }
+
+  Invoke-Check -Name 'Admin snapshots last-run (Solana)' -Block {
+    try {
+      $headers = @{ 'X-ADMIN-KEY' = $AdminKey }
+      $res = Invoke-SmokeHttpJson -CheckName 'Admin snapshots last-run (Solana)' -Uri ("{0}/admin/snapshots/last-run?chain=solana" -f $api) -Headers $headers
+      Add-Result -Name 'Admin snapshots last-run (Solana)' -Ok $true -Detail ("ok=" + (Coalesce $res.ok))
+    } catch {
+      if ($_.Exception.Response -and $_.Exception.Response.StatusCode.value__ -eq 503) {
+        Add-Result -Name 'Admin snapshots last-run (Solana)' -Ok $true -Detail 'skipped (service unavailable)'
+        return
+      }
+      throw
+    }
+  }
+}
+
+if ($UiBase) {
+  Invoke-Check -Name 'UI reachable + CSP present' -Block {
+    $headResponse = Invoke-SmokeHttpHead -CheckName 'UI reachable + CSP present' -Uri $UiBase
+    $statusOk = ([int]$headResponse.StatusCode -ge 200) -and ([int]$headResponse.StatusCode -lt 300)
+    $responseHeaders = $headResponse.Headers
+    $cspHeader = $responseHeaders['Content-Security-Policy']
+    if (-not $cspHeader) {
+      $cspHeader = $responseHeaders['Content-Security-Policy-Report-Only']
+    }
+    $cspOk = -not [string]::IsNullOrWhiteSpace([string]$cspHeader)
+    $ok = $statusOk -and $cspOk
+    $detail = if ($ok) { 'UI 2xx + CSP ok' } elseif (-not $statusOk) { 'UI non-2xx' } else { 'CSP missing' }
+    Add-Result -Name 'UI reachable + CSP present' -Ok $ok -Detail $detail
+  }
+
+  Invoke-Check -Name 'UI runtime smoke (Playwright)' -Block {
+    $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+    $previousSmokeBase = $env:SMOKE_BASE_URL
+
+    try {
+      $env:SMOKE_BASE_URL = $UiBase
+      Push-Location $repoRoot
+
+      $pnpmCmd = Get-Command pnpm -ErrorAction SilentlyContinue
+      if (-not $pnpmCmd) {
+        $corepackCmd = Get-Command corepack -ErrorAction SilentlyContinue
+        if ($corepackCmd) {
+          & corepack enable
+          & corepack prepare pnpm@10.27.0 --activate
+          $pnpmCmd = Get-Command pnpm -ErrorAction SilentlyContinue
+        }
+      }
+
+      if (-not $pnpmCmd) {
+        throw 'pnpm is required for UI runtime smoke and could not be activated via corepack'
+      }
+
+      $uiNodeModules = Join-Path $repoRoot 'packages/ui/node_modules'
+      if (-not (Test-Path $uiNodeModules)) {
+        & pnpm install --frozen-lockfile --prefer-offline
+        if ($LASTEXITCODE -ne 0) {
+          throw "pnpm install failed with exit code $LASTEXITCODE"
+        }
+      }
+
+      $playwrightRoots = @()
+      if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        $playwrightRoots += (Join-Path $env:LOCALAPPDATA 'ms-playwright')
+      }
+      if (-not [string]::IsNullOrWhiteSpace($env:HOME)) {
+        $playwrightRoots += (Join-Path $env:HOME '.cache/ms-playwright')
+      }
+
+      $hasPlaywrightBrowser = $false
+      foreach ($root in $playwrightRoots) {
+        if (-not (Test-Path $root)) {
+          continue
+        }
+
+        $browserBinary = Get-ChildItem -Path $root -Recurse -File -ErrorAction SilentlyContinue |
+          Where-Object { $_.Name -match '^chrome-headless-shell(\.exe)?$' } |
+          Select-Object -First 1
+        if ($browserBinary) {
+          $hasPlaywrightBrowser = $true
+          break
+        }
+      }
+
+      if (-not $hasPlaywrightBrowser) {
+        Write-Host 'Playwright browser not found or stale cache, installing...' -ForegroundColor Yellow
+        & pnpm --filter @arbimind/ui exec playwright install chromium
+        if ($LASTEXITCODE -ne 0) {
+          throw "playwright install failed with exit code $LASTEXITCODE"
+        }
+        Write-Host 'Playwright browser installed.' -ForegroundColor Green
+      }
+      & pnpm --filter @arbimind/ui smoke:runtime:live
+      if ($LASTEXITCODE -ne 0) {
+        throw "UI runtime smoke failed with exit code $LASTEXITCODE"
+      }
+      Add-Result -Name 'UI runtime smoke (Playwright)' -Ok $true -Detail ("base=" + $UiBase)
+    } finally {
+      Pop-Location
+      if ($null -eq $previousSmokeBase) {
+        Remove-Item Env:SMOKE_BASE_URL -ErrorAction SilentlyContinue
+      } else {
+        $env:SMOKE_BASE_URL = $previousSmokeBase
+      }
+    }
+  }
+}
+
+if ($EvmAddress -and $EvmAddress -match '^0x[a-fA-F0-9]{40}$') {
+  Invoke-Check -Name 'Portfolio EVM summary' -Block {
+    try {
+      $res = Invoke-SmokeHttpJson -CheckName 'Portfolio EVM summary' -Uri ("{0}/portfolio/evm?address={1}" -f $api, $EvmAddress)
+      $ok = $res.chain -eq 'evm'
+      Add-Result -Name 'Portfolio EVM summary' -Ok $ok -Detail ("chain=" + (Coalesce $res.chain))
+    } catch {
+      if ($_.Exception.Response -and $_.Exception.Response.StatusCode.value__ -eq 503) {
+        Add-Result -Name 'Portfolio EVM summary' -Ok $true -Detail 'skipped (service unavailable)'
+        return
+      }
+      throw
+    }
+  }
+
+  Invoke-Check -Name 'Portfolio EVM timeseries' -Block {
+    $res = Invoke-SmokeHttpJson -CheckName 'Portfolio EVM timeseries' -Uri ("{0}/portfolio/evm/timeseries?address={1}&range=30d" -f $api, $EvmAddress)
+    $ok = ($null -ne $res.points)
+    Add-Result -Name 'Portfolio EVM timeseries' -Ok $ok -Detail ("method=" + (Coalesce $res.method))
+  }
+}
+
+$base58Regex = '^[123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]{32,44}$'
+if ($SolanaAddress -and $SolanaAddress -match $base58Regex) {
+  Invoke-Check -Name 'Portfolio Solana summary' -Block {
+    try {
+      $res = Invoke-SmokeHttpJson -CheckName 'Portfolio Solana summary' -Uri ("{0}/portfolio/solana?address={1}" -f $api, $SolanaAddress)
+      $ok = $res.chain -eq 'solana'
+      Add-Result -Name 'Portfolio Solana summary' -Ok $ok -Detail ("chain=" + (Coalesce $res.chain))
+    } catch {
+      if ($_.Exception.Response -and $_.Exception.Response.StatusCode.value__ -eq 503) {
+        Add-Result -Name 'Portfolio Solana summary' -Ok $true -Detail 'skipped (service unavailable)'
+        return
+      }
+      throw
+    }
+  }
+
+  Invoke-Check -Name 'Portfolio Solana timeseries' -Block {
+    $res = Invoke-SmokeHttpJson -CheckName 'Portfolio Solana timeseries' -Uri ("{0}/portfolio/solana/timeseries?address={1}&range=30d" -f $api, $SolanaAddress)
+    $ok = ($null -ne $res.points)
+    Add-Result -Name 'Portfolio Solana timeseries' -Ok $ok -Detail ("method=" + (Coalesce $res.method))
+  }
+}
+
+if ($BotCanary) {
+  Invoke-Check -Name 'Bot canary config sanity' -Block {
+    if ($CanaryNotionalEth -le 0) {
+      throw 'CanaryNotionalEth must be > 0'
+    }
+    if ($CanaryMaxDailyLossEth -le 0) {
+      throw 'CanaryMaxDailyLossEth must be > 0'
+    }
+    if ($CanaryMaxDailyLossEth -ge $CanaryNotionalEth) {
+      throw 'CanaryMaxDailyLossEth should be lower than CanaryNotionalEth for safer rollout'
+    }
+
+    Add-Result -Name 'Bot canary config sanity' -Ok $true -Detail ("notional=" + $CanaryNotionalEth + ", maxLoss=" + $CanaryMaxDailyLossEth)
+  }
+}
+
+Write-Host "`nSmoke Summary" -ForegroundColor Cyan
+$results | Format-Table -AutoSize
+
+$fails = @($results | Where-Object { $_.Status -eq 'FAIL' }).Count
+if ($fails -gt 0) {
+  Write-Host "`n$fails check(s) failed." -ForegroundColor Red
+  exit 1
+}
+
+Write-Host "`nAll smoke checks passed." -ForegroundColor Green
+exit 0

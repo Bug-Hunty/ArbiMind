@@ -1,0 +1,190 @@
+name: Post-Deploy Smoke
+
+on:
+  workflow_run:
+    workflows: ["Deploy UI to Vercel"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      backend_base:
+        description: Backend base URL
+        required: false
+        default: https://backend-production-0932.up.railway.app
+      ui_base:
+        description: UI base URL
+        required: false
+        default: https://arbimind.vercel.app
+      analytics_only:
+        description: Run only analytics smoke check
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: post-deploy-smoke-${{ github.event.workflow_run.head_branch || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history so the gate can diff the DEPLOYED backend commit
+          # against the expected one. A shallow clone makes that comparison
+          # impossible and forces the gate into its fail-safe exact-match path.
+          fetch-depth: 0
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v6
+        with:
+          path: ~\AppData\Local\ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: Resolve endpoints
+        id: resolve
+        shell: pwsh
+        run: |
+          $backend = "${{ github.event.inputs.backend_base }}"
+          if ([string]::IsNullOrWhiteSpace($backend)) { $backend = "https://backend-production-0932.up.railway.app" }
+
+          $ui = "${{ github.event.inputs.ui_base }}"
+          if ([string]::IsNullOrWhiteSpace($ui)) { $ui = "https://arbimind.vercel.app" }
+
+          "backend=$backend" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "ui=$ui" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      # The Railway backend redeploys on the same push that triggers the Vercel
+      # deploy, so smoke used to start while it was still booting. Railway's edge
+      # answers 404 until an instance is live, which is indistinguishable from a
+      # broken route once smoke is running -- so wait here rather than widening
+      # the retry list inside the checks. See #294.
+      - name: Wait for backend readiness
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          BACKEND_BASE: ${{ steps.resolve.outputs.backend }}
+        run: |
+          $backend = $env:BACKEND_BASE.TrimEnd('/')
+          $healthUrl = "$backend/api/health"
+          $deadline = (Get-Date).AddMinutes(3)
+          $delaySeconds = 5
+          $attempt = 0
+
+          Write-Host "Waiting for backend readiness: $healthUrl"
+
+          while ((Get-Date) -lt $deadline) {
+            $attempt++
+
+            try {
+              $res = Invoke-RestMethod -Uri $healthUrl -Method Get -TimeoutSec 10
+
+              if ($res.success -eq $true -or $res.status -eq 'healthy') {
+                Write-Host "Backend ready after attempt $attempt."
+                exit 0
+              }
+
+              Write-Host "Backend responded but is not healthy yet: $($res | ConvertTo-Json -Compress)"
+            }
+            catch {
+              $status = $null
+              if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                $status = [int]$_.Exception.Response.StatusCode.value__
+              }
+              Write-Host "Backend not ready yet. Attempt=$attempt Status=$status Error=$($_.Exception.Message)"
+            }
+
+            Start-Sleep -Seconds $delaySeconds
+          }
+
+          throw "Backend did not become ready within 3 minutes: $healthUrl"
+
+      # Health alone does not prove the deployment happened. The backend deploys
+      # on Railway independently of the Vercel deploy that triggers this run, so
+      # a lagging or skipped backend deploy leaves the PREVIOUS commit serving --
+      # healthy, and passing every check. See #377.
+      #
+      # The gate verifies BACKEND freshness, not repo freshness: Railway only
+      # rebuilds when backend-relevant files change, so workflow/docs/UI-only
+      # commits legitimately keep the previous backend SHA and must not fail.
+      #
+      # Enforced for workflow_run only: workflow_dispatch may target an arbitrary
+      # backend, where a SHA match is neither expected nor meaningful.
+      - name: Wait for backend to serve the deployed commit
+        if: github.event_name == 'workflow_run'
+        timeout-minutes: 12
+        shell: pwsh
+        env:
+          BACKEND_BASE: ${{ steps.resolve.outputs.backend }}
+          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          ./scripts/wait-for-backend-version.ps1 `
+            -BackendBase $env:BACKEND_BASE `
+            -ExpectedSha $env:EXPECTED_SHA
+
+      - name: Run smoke script
+        timeout-minutes: 15
+        shell: pwsh
+        env:
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+          EVM_ARB_ACCOUNT: ${{ secrets.EVM_ARB_ACCOUNT }}
+          SOLANA_ARB_ACCOUNT: ${{ secrets.SOLANA_ARB_ACCOUNT }}
+        run: |
+          [void][scriptblock]::Create((Get-Content ./scripts/smoke-post-deploy.ps1 -Raw))
+
+          # Must be a hashtable: splatting an ARRAY binds positionally, so the
+          # '-BackendBase' string itself lands in $BackendBase and the real URL
+          # lands in $AdminKey. See #294.
+          # RequireDatabase: production must not score a green run when the
+          # backend has no database. Without it every DB-backed check reports
+          # "skipped (DATABASE_URL not set)" and passes. See #370.
+          $smokeArgs = @{
+            BackendBase     = '${{ steps.resolve.outputs.backend }}'
+            UiBase          = '${{ steps.resolve.outputs.ui }}'
+            RequireDatabase = $true
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace($env:ADMIN_API_KEY)) {
+            $smokeArgs['AdminKey'] = $env:ADMIN_API_KEY
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace($env:EVM_ARB_ACCOUNT)) {
+            $smokeArgs['EvmAddress'] = $env:EVM_ARB_ACCOUNT
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace($env:SOLANA_ARB_ACCOUNT)) {
+            $smokeArgs['SolanaAddress'] = $env:SOLANA_ARB_ACCOUNT
+          }
+
+          if ("${{ github.event.inputs.analytics_only }}" -eq "true") {
+            $smokeArgs['OnlyAnalytics'] = $true
+          }
+
+          & ./scripts/smoke-post-deploy.ps1 @smokeArgs
+
+      - name: Notify failure webhook
+        if: failure()
+        shell: pwsh
+        env:
+          ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:ALERT_WEBHOOK_URL)) {
+            Write-Host 'ALERT_WEBHOOK_URL not set, skipping notification.'
+            exit 0
+          }
+
+          $runUrl = "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          $msg = "🚨 ArbiMind post-deploy smoke FAILED on ${{ github.ref_name }}. Backend: ${{ steps.resolve.outputs.backend }} | UI: ${{ steps.resolve.outputs.ui }} | Run: $runUrl"
+
+          if ($env:ALERT_WEBHOOK_URL -match 'discord(?:app)?\.com/api/webhooks') {
+            $payload = @{ content = $msg } | ConvertTo-Json -Compress
+          }
+          else {
+            $payload = @{ text = $msg } | ConvertTo-Json -Compress
+          }
+
+          Invoke-RestMethod -Uri $env:ALERT_WEBHOOK_URL -Method Post -ContentType 'application/json' -Body $payload
