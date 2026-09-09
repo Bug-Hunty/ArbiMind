@@ -39,7 +39,7 @@
     "ml-matrix": "^6.10.4",
     "ml-regression": "^6.3.0",
     "natural": "^6.10.4",
-    "node-cron": "^3.0.3",
+    "node-cron": "^4.6.0",
     "sentiment": "^5.0.2",
     "technicalindicators": "^3.1.0",
     "viem": "^2.21.0",
