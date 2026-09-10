@@ -17,6 +17,7 @@ import { LandingTracker } from './LandingTracker';
 import { NetEdgeAccumulator } from './NetEdgeAccumulator';
 import { SessionMetrics } from './SessionMetrics';
 import { ShadowSnapshotWriter } from './ShadowReport';
+import { SolPriceResolver } from './SolPriceResolver';
 import type { TierPolicy } from './SpeedTierPolicy';
 import { TOKEN_REGISTRY, MINT_TO_SYMBOL } from './config';
 
@@ -180,6 +181,7 @@ export class SolanaExecutor {
   private readonly netEdgeAccumulator: NetEdgeAccumulator;
   private readonly gateConfig: ExecutionGateConfig;
   private readonly sessionMetrics: SessionMetrics;
+  private readonly solPriceResolver: SolPriceResolver;
   private readonly shadowWriter: ShadowSnapshotWriter | null = null;
 
   constructor(
@@ -198,6 +200,7 @@ export class SolanaExecutor {
     this.landingTracker = deps?.landingTracker ?? new LandingTracker();
     this.netEdgeAccumulator = deps?.netEdgeAccumulator ?? new NetEdgeAccumulator();
     this.sessionMetrics = deps?.sessionMetrics ?? new SessionMetrics();
+    this.solPriceResolver = new SolPriceResolver(this.config.solPriceUsd ?? null);
 
     // Merge gate config: explicit overrides > tier defaults > compiled defaults
     const tierMinNet = deps?.tierPolicy?.minNetProfitUsd;
@@ -586,7 +589,17 @@ export class SolanaExecutor {
 
     // --- EXP-020: Fee-aware execution gate ---
     {
-      const solPriceUsd = this.inventoryManager?.getInventorySnapshot()?.solPriceUsd ?? this.config.solPriceUsd ?? 0;
+      const currentSolPriceUsd = this.inventoryManager?.getInventorySnapshot()?.solPriceUsd ?? null;
+      const quoteInputAmount = Number(quoteResponse.inAmount ?? sizedOpportunity.amountLamports);
+      const quoteOutputAmount = Number(quoteResponse.outAmount ?? 0);
+      const isSolToStable =
+        sizedOpportunity.inputMint === 'So11111111111111111111111111111111111111112' &&
+        ['EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB'].includes(sizedOpportunity.outputMint);
+      const currentQuotePriceUsd = isSolToStable && quoteInputAmount > 0 && quoteOutputAmount > 0
+        ? (quoteOutputAmount / 1_000_000) / (quoteInputAmount / 1_000_000_000)
+        : null;
+      const solPrice = this.solPriceResolver.resolve(currentQuotePriceUsd ?? currentSolPriceUsd);
+      const solPriceUsd = solPrice.priceUsd ?? 0;
       let estimatedExecutionFeeUsd = 0;
       let feeEstimateAvailable = false;
       let feeEstimateSource: string | null = null;
@@ -615,8 +628,8 @@ export class SolanaExecutor {
         }
       }
       this.sessionMetrics.recordFeeEstimation(feeEstimateAvailable, {
-        source: feeEstimateSource,
-        ageMs: 0,
+        source: feeEstimateSource ?? solPrice.source,
+        ageMs: solPrice.ageMs,
         estimatedFeeLamports,
         estimatedExecutionFeeUsd: feeEstimateAvailable ? estimatedExecutionFeeUsd : null,
       });
@@ -670,14 +683,35 @@ export class SolanaExecutor {
       // structurally unreachable. Every value used here is already an estimate
       // (expectedGrossUsd, estimatedExecutionFeeUsd, netExpectedUsd), so
       // recording it as "expected" is accurate in both modes.
-      this.sessionMetrics.recordFeeNormalization(notionalUsd, estimatedExecutionFeeUsd, gate.netExpectedUsd);
-      this.sessionMetrics.recordExpectedTradeEconomics(
-        sizedOpportunity.expectedProfitUsd,
-        estimatedExecutionFeeUsd,
-        gate.netExpectedUsd,
-        gate.passed,
-      );
-      this.sessionMetrics.recordQuoteAge(Date.now() - quoteRequestedAtMs);
+      if (feeEstimateAvailable && Number.isFinite(gate.netExpectedUsd)) {
+        this.sessionMetrics.recordFeeNormalization(notionalUsd, estimatedExecutionFeeUsd, gate.netExpectedUsd);
+      }
+      this.sessionMetrics.recordEconomicsObservation({
+        schemaVersion: 1,
+        timestampMs: this.sessionMetrics.nowMs(),
+        poolAddress: ammMeta.ammKey || null,
+        pair: sizedOpportunity.label,
+        ammLabel: ammMeta.ammLabel,
+        routeType: routePlan.length <= 1 ? 'direct' : `multihop_${routePlan.length}`,
+        notionalUsd,
+        expectedGrossUsd: sizedOpportunity.expectedProfitUsd,
+        estimatedExecutionFeeUsd: feeEstimateAvailable ? estimatedExecutionFeeUsd : null,
+        estimatedSlippageCostUsd: Number.isFinite(slippageCostUsd) ? slippageCostUsd : null,
+        riskBufferUsd: this.gateConfig.riskBufferUsd,
+        executionHaircutUsd: this.gateConfig.executionHaircutUsd,
+        netExpectedUsd: Number.isFinite(gate.netExpectedUsd) ? gate.netExpectedUsd : null,
+        edgeBps: Number.isFinite(edgeBps) ? edgeBps : null,
+        quoteAgeMs: Date.now() - quoteRequestedAtMs,
+        feeEstimateAvailable,
+        feeEstimateSource: feeEstimateSource ?? solPrice.source,
+        feeEstimateAgeMs: solPrice.ageMs,
+        passed: gate.passed,
+        rejectReason: gate.rejectReason,
+        simulationAttempted: false,
+        simulationSucceeded: false,
+        simulationFailureReason: null,
+      });
+      this.sessionMetrics.recordQuoteAge(this.sessionMetrics.nowMs() - quoteRequestedAtMs);
 
       this.logger.info('[SOLANA] execution_gate', {
         passed: gate.passed,
