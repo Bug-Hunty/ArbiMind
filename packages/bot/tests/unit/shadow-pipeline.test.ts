@@ -279,27 +279,81 @@ describe('production scanner shadow reachability', () => {
     expectNoExecution(internals);
   });
 
-  it('live-capable mode still requires the explicit trading signer', async () => {
+  /**
+   * D14. Retained from #8's scanner-shadow-funding.test.ts, which was dropped as
+   * a brittle duplicate: it stubbed five Scanner collaborators wholesale and so
+   * tested its own model of Scanner rather than Scanner's real composition.
+   *
+   * The case above covers LOG_ONLY for both trading values. This pins the other
+   * half of the boundary, which nothing else did: trading DISABLED with
+   * logOnly=false, while funding AND rebalance are fully configured. Enabling
+   * the funding configuration must not, by itself, confer any authority.
+   *
+   * Asserts authority and inertness, not call choreography -- the production
+   * gate is `liveExecutionEnabled && autoFundEnabled`, and
+   * `liveExecutionEnabled = tradingEnabled && !logOnly`.
+   */
+  it('trading disabled suppresses funding authority even with funding and rebalance enabled', async () => {
+    const unrelatedCredential = bs58.encode(Keypair.generate().secretKey);
+    vi.stubEnv('SOLANA_TRADING_ENABLED', 'false');
+    vi.stubEnv('SOLANA_LOG_ONLY', 'false');
+    vi.stubEnv('SOLANA_AUTO_FUND_ENABLED', 'true');
+    vi.stubEnv('SOLANA_AUTO_REBALANCE_ENABLED', 'true');
+    vi.stubEnv('SOLANA_TREASURY_SECRET_KEY', unrelatedCredential);
+    vi.stubEnv('SOLANA_ARB_SECRET_KEY', unrelatedCredential);
+
+    const fromSecretKey = vi.spyOn(Keypair, 'fromSecretKey');
+    const fromSeed = vi.spyOn(Keypair, 'fromSeed');
+    const internals = await createScanner();
+    await driveOpportunity(internals);
+
+    expect(internals.inventoryManager).toBeNull();
+    expect(internals.fundingManager).toBeNull();
+    expect(internals.resolveWallet()).toBeNull();
+    expect(fromSecretKey).not.toHaveBeenCalled();
+    expect(fromSeed).not.toHaveBeenCalled();
+    expectNoExecution(internals);
+  });
+
+  /**
+   * CONTRACT MIGRATION (PR #8). This previously asserted that live-capable mode
+   * without the explicit trading signer CONSTRUCTS and then stays inert: no
+   * quote, no gate evaluation, no execution.
+   *
+   * The requirement is now enforced earlier. `tradingEnabled=true` with
+   * `logOnly=false` and no explicit signer is INVALID CONFIGURATION, not a
+   * healthy-but-inert runtime, so construction fails before any quote, sign or
+   * send I/O can occur.
+   *
+   * The property being defended is unchanged: treasury/arb aliases must never
+   * grant trading authority. Only the enforcement boundary moved, from
+   * inertness to fatality.
+   */
+  it('live-capable mode without the explicit trading signer is fatal at construction', async () => {
     vi.stubEnv('SOLANA_TRADING_ENABLED', 'true');
     vi.stubEnv('SOLANA_LOG_ONLY', 'false');
     const unrelatedCredential = bs58.encode(Keypair.generate().secretKey);
+    // Present, and still must not authorize trading.
     vi.stubEnv('SOLANA_TREASURY_SECRET_KEY', unrelatedCredential);
     vi.stubEnv('SOLANA_ARB_SECRET_KEY', unrelatedCredential);
-    const internals = await createScanner();
-    expect(internals.executor).not.toBeNull();
-    await driveOpportunity(internals);
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(internals.sessionMetrics.getSummary().gateEvaluated).toBe(0);
-    expectNoExecution(internals);
 
-    // Positive control for the signer-loading spies: live-capable construction
-    // consumes the explicit trading credential through the real decoder.
+    await expect(createScanner()).rejects.toThrow('Missing SOLANA_PRIVATE_KEY_BASE58');
+
+    // Fatal BEFORE any execution I/O: no quote was ever requested.
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(boundary.sign).not.toHaveBeenCalled();
+    expect(boundary.send).not.toHaveBeenCalled();
+    expect(boundary.confirm).not.toHaveBeenCalled();
+
+    // Positive control: the EXPLICIT trading credential permits construction and
+    // is consumed through the real decoder. Proves the rejection above is about
+    // the missing explicit signer, not about live-capable mode being unbuildable.
     const fromSecretKey = vi.spyOn(Keypair, 'fromSecretKey');
     const { SolanaExecutor } = await import('../../src/solana/Executor');
     const { solanaExecutorConfig } = await import('../../src/solana/config');
     const liveExecutor = new SolanaExecutor({ ...solanaExecutorConfig, privateKeyBase58: unrelatedCredential });
     directExecutors.push(liveExecutor);
     expect(fromSecretKey).toHaveBeenCalledTimes(1);
-    expectNoExecution(internals);
+    expect(boundary.send).not.toHaveBeenCalled();
   });
 });

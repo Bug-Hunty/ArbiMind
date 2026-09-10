@@ -24,6 +24,7 @@ try {
 } catch (error) {
   const message = error instanceof Error ? error.stack || error.message : String(error);
   console.error(`env bootstrap failed: ${message}`);
+  process.exit(1);
 }
 
 // Check before services start and outside the LOG_ONLY graceful-error handler.
@@ -85,6 +86,11 @@ async function main(): Promise<void> {
     const configModule = await import('./config/index.js');
     console.error('[BOOT] imported config/index');
 
+    // Reject invalid startup configuration before loading scanner dependencies.
+    const { refreshConfig, validateConfig, config } = configModule;
+    refreshConfig();
+    validateConfig();
+
     console.error('[BOOT] importing config/identity');
     const identityModule = await import('./config/identity.js');
     console.error('[BOOT] imported config/identity');
@@ -105,22 +111,20 @@ async function main(): Promise<void> {
     const solanaRpcGuardModule = await import('./solana/solanaRpcGuard.js');
     console.error('[BOOT] imported solana/solanaRpcGuard');
 
-    const { refreshConfig, validateConfig, config } = configModule;
     const { getIdentitySource, shortAddress } = identityModule;
     const { Logger } = loggerModule;
     const { SolanaScanner } = solanaModule;
     const { solanaConfig, solanaExecutorConfig } = solanaConfigModule;
     const { checkSolanaRpcHealth } = solanaRpcGuardModule;
+    const { validateExecutionSigner } = await import('./solana/signingIdentity.js');
+
+    // Missing or invalid execution credentials are fatal before an RPC fallback
+    // can downgrade the configuration and hide the identity error.
+    validateExecutionSigner(solanaExecutorConfig);
 
     const logger = new Logger('Main');
 
-    // Refresh config with loaded env vars
-    refreshConfig();
-    
     logger.info('🚀 Starting ArbiMind Arbitrage Bot...');
-    
-    // Validate configuration
-    validateConfig();
     logger.info('✅ Configuration validated');
 
     // No-scanner/no-execution mode is a clean exit, without providers or service timers.
@@ -130,8 +134,10 @@ async function main(): Promise<void> {
     }
 
     // Log selected chain
-    logger.info(`📡 Selected chain: ${config.evmChain} (chainId=${config.evmChainId})`);
-    logger.info(`🌐 RPC: ${config.ethereumRpcUrl.split('/').slice(0, 3).join('/')}/...`);
+    if (evmScannerEnabled) {
+      logger.info(`📡 Selected chain: ${config.evmChain} (chainId=${config.evmChainId})`);
+      logger.info(`🌐 RPC: ${config.ethereumRpcUrl.split('/').slice(0, 3).join('/')}/...`);
+    }
     if (config.logOnly) {
       logger.info('📊 Running in LOG_ONLY mode (no trades will be executed)');
     }
@@ -155,7 +161,7 @@ async function main(): Promise<void> {
       `🔐 Identity: ${identitySource}${effectiveAddress ? ` (${shortAddress(effectiveAddress)})` : ''} | mode=${config.logOnly ? 'LOG_ONLY' : 'LIVE'}`
     );
 
-    if (config.canaryEnabled) {
+    if (evmScannerEnabled && config.canaryEnabled) {
       logger.warn('🧪 Running in CANARY mode', {
         canaryNotionalEth: config.canaryNotionalEth,
         canaryMaxDailyLossEth: config.canaryMaxDailyLossEth
@@ -186,8 +192,8 @@ async function main(): Promise<void> {
       evmChain: config.evmChain,
       chainId: config.evmChainId,
       evmScannerEnabled,
-      mode: config.logOnly ? 'LOG_ONLY' : 'LIVE',
-      canary: config.canaryEnabled,
+      mode: (evmScannerEnabled ? config.logOnly : solanaExecutorConfig.logOnly) ? 'LOG_ONLY' : 'LIVE',
+      canary: evmScannerEnabled && config.canaryEnabled,
       v3Enabled: !isEnvTrue(process.env['ENABLE_V3_QUOTES'] === 'false' ? 'false' : undefined),
       scanIntervalMs: config.scanIntervalMs,
       minProfitEth: config.minProfitEth,

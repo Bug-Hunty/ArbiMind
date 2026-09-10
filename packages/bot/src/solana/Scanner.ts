@@ -19,7 +19,7 @@ import { SessionMetrics } from './SessionMetrics';
 import { assertExecutionProvenance, readRuntimeProvenance } from './RuntimeProvenance';
 import { publishPoolResolution, publishRuntimeProvenance, publishSafetyConfiguration } from './ReadinessProducers';
 import { Connection, Keypair } from '@solana/web3.js';
-import bs58 from 'bs58';
+import { parseTradingSigner } from './signingIdentity';
 
 const logger = new Logger('SolanaScanner');
 const STABLE_SYMBOLS = new Set(['USDC', 'USDT']);
@@ -189,7 +189,10 @@ export class SolanaScanner {
     // Set up inventory manager
     if (this.liveExecutionEnabled && this.executor && inventoryConfig.autoFundEnabled) {
       this.inventoryManager = new SolanaInventoryManager({
-        config: inventoryConfig,
+        config: {
+          ...inventoryConfig,
+          autoRebalanceEnabled: inventoryConfig.autoRebalanceEnabled && !solanaExecutorConfig.logOnly,
+        },
         jupiterBaseUrl: solanaExecutorConfig.jupiterBaseUrl,
         maxSlippageBps: solanaExecutorConfig.maxSlippageBps,
         asLegacyTransaction: solanaExecutorConfig.asLegacyTransaction,
@@ -205,7 +208,7 @@ export class SolanaScanner {
     // FundingManager — step 1: balance snapshot logging on each tick
     if (this.liveExecutionEnabled && inventoryConfig.autoFundEnabled && solanaExecutorConfig.rpcUrl) {
       this.fundingManager = new FundingManager({
-        autoRebalanceEnabled: inventoryConfig.autoRebalanceEnabled,
+        autoRebalanceEnabled: inventoryConfig.autoRebalanceEnabled && solanaExecutorConfig.tradingEnabled && !solanaExecutorConfig.logOnly,
         targetSolReserve: inventoryConfig.targetSolReserve,
         minSolReserve: inventoryConfig.minSolReserve,
         baseAssetMint: inventoryConfig.baseAssetMint,
@@ -309,7 +312,9 @@ export class SolanaScanner {
               error: err instanceof Error ? err.message : String(err),
             });
           });
-        this.inventoryManager.startRebalanceLoop(connection, wallet);
+        if (solanaExecutorConfig.tradingEnabled && !solanaExecutorConfig.logOnly) {
+          this.inventoryManager.startRebalanceLoop(connection, wallet);
+        }
       }
     }
 
@@ -365,32 +370,18 @@ export class SolanaScanner {
   }
 
   /**
-   * Resolve wallet keypair from config (mirrors Executor.getWallet parsing).
+   * Use the same explicit trading-identity parser as the executor.
    */
   private resolveWallet(): Keypair | null {
     if (!this.liveExecutionEnabled) return null;
     const raw = solanaExecutorConfig.privateKeyBase58?.trim();
     if (!raw) return null;
     try {
-      const decoded = bs58.decode(raw);
-      if (decoded.length === 64) return Keypair.fromSecretKey(decoded);
-      if (decoded.length === 32) return Keypair.fromSeed(decoded);
-    } catch { /* try next */ }
-    try {
-      if (/^[0-9a-fA-F]{64}$/.test(raw)) {
-        return Keypair.fromSeed(Uint8Array.from(Buffer.from(raw, 'hex')));
-      }
-      if (raw.startsWith('[') && raw.endsWith(']')) {
-        const parsed = JSON.parse(raw) as number[];
-        if (Array.isArray(parsed) && parsed.every((v) => Number.isInteger(v) && v >= 0 && v <= 255)) {
-          const bytes = Uint8Array.from(parsed);
-          if (bytes.length === 64) return Keypair.fromSecretKey(bytes);
-          if (bytes.length === 32) return Keypair.fromSeed(bytes);
-        }
-      }
-    } catch { /* ignore */ }
-    logger.warn('[SOLANA] resolveWallet: unsupported key format');
-    return null;
+      return parseTradingSigner(raw).keypair;
+    } catch {
+      logger.warn('[SOLANA] resolveWallet: invalid explicit trading signer');
+      return null;
+    }
   }
 
   /**
@@ -416,7 +407,7 @@ export class SolanaScanner {
    */
   private async scanPools(): Promise<void> {
     // FundingManager: snapshot + (future) rebalance on each tick
-    if (this.fundingManager && this.scanConnection && this.scanWallet) {
+    if (!solanaExecutorConfig.logOnly && solanaExecutorConfig.tradingEnabled && this.fundingManager && this.scanConnection && this.scanWallet) {
       try {
         await this.fundingManager.checkAndRebalance(
           this.scanConnection,
