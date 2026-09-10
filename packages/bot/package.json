@@ -14,7 +14,7 @@
     "build": "tsc",
     "dev": "tsx watch src/index.ts",
     "canary": "tsx src/canary.ts",
-    "start": "node dist/index.js",
+    "start": "npm run build && node dist/index.js",
     "test": "vitest run",
     "test:ui": "vitest --ui",
     "test:watch": "vitest --watch",

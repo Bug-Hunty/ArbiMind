@@ -111,7 +111,15 @@ export interface EconomicObservation {
 }
 
 export interface ReadinessHealth {
-  feeEstimation: { attempted: number; available: number; unavailable: number };
+  feeEstimation: {
+    attempted: number;
+    available: number;
+    unavailable: number;
+    source?: string | null;
+    ageMs?: number | null;
+    estimatedFeeLamports?: number | null;
+    estimatedExecutionFeeUsd?: number | null;
+  };
   poolResolution: { configured: number; resolved: number; unresolved: number };
   observationPersistence: { attempted: number; succeeded: number; failed: number };
   simulation: { attempted: number; succeeded: number; failed: number };
@@ -543,22 +551,34 @@ export class SessionMetrics {
     passed = false,
     timestampMs = Date.now(),
   ): void {
-    this.grossUsdTotal += grossUsd;
-    this.executionFeeUsdTotal += executionFeeUsd;
-    this.netEdgeUsdTotal += netEdgeUsd;
-    this.tradeCount++;
+    const usable = [grossUsd, executionFeeUsd, netEdgeUsd].every(Number.isFinite);
+    if (usable) {
+      this.grossUsdTotal += grossUsd;
+      this.executionFeeUsdTotal += executionFeeUsd;
+      this.netEdgeUsdTotal += netEdgeUsd;
+      this.tradeCount++;
+    }
     this.economicObservations.push({
       timestampMs,
       netExpectedUsd: Number.isFinite(netEdgeUsd) ? netEdgeUsd : null,
-      usable: Number.isFinite(netEdgeUsd),
+      usable,
       passed,
     });
   }
 
-  recordFeeEstimation(available: boolean): void {
+  recordFeeEstimation(
+    available: boolean,
+    details: {
+      source?: string | null;
+      ageMs?: number | null;
+      estimatedFeeLamports?: number | null;
+      estimatedExecutionFeeUsd?: number | null;
+    } = {},
+  ): void {
     this.readinessHealth.feeEstimation.attempted++;
     if (available) this.readinessHealth.feeEstimation.available++;
     else this.readinessHealth.feeEstimation.unavailable++;
+    Object.assign(this.readinessHealth.feeEstimation, details);
   }
 
   recordPoolResolution(configured: number, resolved: number): void {

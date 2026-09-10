@@ -155,6 +155,11 @@ export class SolanaScanner {
     const summaryIntervalMs = Number(process.env['SESSION_SUMMARY_INTERVAL_MS'] || '600000');
     this.sessionMetrics = new SessionMetrics({ summaryIntervalMs });
     this.sessionMetrics.setAiScoringMode(config.aiScoringMode);
+    this.sessionMetrics.setReadinessProvenance(
+      process.env['ARBIMIND_SOURCE_SHA'] ?? process.env['GIT_SHA'] ?? null,
+      process.env['ARBIMIND_RUNTIME_SHA'] ?? process.env['GIT_SHA'] ?? null,
+    );
+    this.sessionMetrics.setRequiredSafetyConfiguration(solanaExecutorConfig.logOnly);
 
     this.executor = solanaExecutorConfig.tradingEnabled
       ? new SolanaExecutor(solanaExecutorConfig, feeEstimatorConfig, {
@@ -422,6 +427,8 @@ export class SolanaScanner {
       }
       snapshots.push({ poolAddress, pairData });
     }
+
+    this.sessionMetrics.recordPoolResolution(solanaConfig.watchedPools.length, snapshots.length);
 
     if (!snapshots.length) return;
 

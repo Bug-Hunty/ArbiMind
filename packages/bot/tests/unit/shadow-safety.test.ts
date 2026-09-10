@@ -130,6 +130,7 @@ function makeConfig(overrides: Partial<SolanaExecutorConfig> = {}): SolanaExecut
     takeProfitPct: 0,
     maxSlippageBps: 50,
     quoteMaxAgeMs: 10_000,
+    solPriceUsd: 150,
     rpcUrl: 'http://localhost:8899',
     privateKeyBase58: generateSignerBase58(),
     jupiterBaseUrl: 'https://jupiter.invalid',
@@ -596,6 +597,22 @@ describe('shadow mode safety', () => {
   });
 
   describe('quote failure classification', () => {
+    it('fails closed when SOL/USD pricing is unavailable', async () => {
+      installFetchMock();
+      const metrics = new SessionMetrics();
+      const executor = new SolanaExecutor(makeConfig({ solPriceUsd: 0 }), undefined, {
+        gateConfig: PERMISSIVE_GATE,
+        sessionMetrics: metrics,
+      });
+
+      const result = await executor.execute(makeOpportunity());
+
+      expect(result.success).toBe(false);
+      expect(result.skipReason).toContain('fee_estimate_unavailable');
+      expect(metrics.getShadowSnapshot().economicObservations.at(-1)?.usable).toBe(false);
+      expect(sendTransaction).not.toHaveBeenCalled();
+    });
+
     it('separates rate limiting from other RPC failures', () => {
       expect(classifyQuoteError('Jupiter quote HTTP 429')).toBe('rate_limited');
       expect(classifyQuoteError('Too Many Requests')).toBe('rate_limited');

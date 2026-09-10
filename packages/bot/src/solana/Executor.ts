@@ -49,6 +49,8 @@ export interface SolanaExecutorConfig {
   takeProfitPct: number;
   maxSlippageBps: number;
   quoteMaxAgeMs: number;
+  /** Explicit SOL/USD fallback used only when no inventory price is available. */
+  solPriceUsd?: number;
   rpcUrl: string;
   privateKeyBase58: string;
   jupiterBaseUrl: string;
@@ -584,9 +586,11 @@ export class SolanaExecutor {
 
     // --- EXP-020: Fee-aware execution gate ---
     {
-      const solPriceUsd = this.inventoryManager?.getInventorySnapshot()?.solPriceUsd ?? 0;
+      const solPriceUsd = this.inventoryManager?.getInventorySnapshot()?.solPriceUsd ?? this.config.solPriceUsd ?? 0;
       let estimatedExecutionFeeUsd = 0;
       let feeEstimateAvailable = false;
+      let feeEstimateSource: string | null = null;
+      let estimatedFeeLamports: number | null = null;
 
       if (solPriceUsd > 0 && connection) {
         try {
@@ -600,15 +604,22 @@ export class SolanaExecutor {
           );
           // Estimated total fee ≈ base fee (5000) + CU * microLamportsPerCU
           // Use the priority fee estimate as total fee proxy for gate purposes
-          const estimatedFeeLamports = feeEst.maxLamports + 5000;
-          estimatedExecutionFeeUsd = (estimatedFeeLamports / 1e9) * solPriceUsd;
+          const totalFeeLamports = feeEst.maxLamports + 5000;
+          estimatedFeeLamports = totalFeeLamports;
+          estimatedExecutionFeeUsd = (totalFeeLamports / 1e9) * solPriceUsd;
+          feeEstimateSource = feeEst.source;
           feeEstimateAvailable = Number.isFinite(estimatedExecutionFeeUsd) && estimatedExecutionFeeUsd >= 0;
         } catch {
           // Can't estimate → use fallback
           estimatedExecutionFeeUsd = 0;
         }
       }
-      this.sessionMetrics.recordFeeEstimation(feeEstimateAvailable);
+      this.sessionMetrics.recordFeeEstimation(feeEstimateAvailable, {
+        source: feeEstimateSource,
+        ageMs: 0,
+        estimatedFeeLamports,
+        estimatedExecutionFeeUsd: feeEstimateAvailable ? estimatedExecutionFeeUsd : null,
+      });
 
       // Slippage cost estimation from quote
       const outputMint = String(
@@ -629,12 +640,18 @@ export class SolanaExecutor {
         outputDecimals,
       );
 
-      const gate = this.evaluateExecutionGate(
-        sizedOpportunity.expectedProfitUsd,
-        estimatedExecutionFeeUsd,
-        slippageCostUsd,
-        sizedOpportunity.estimatedNotionalUsd,
-      );
+      const gate = feeEstimateAvailable
+        ? this.evaluateExecutionGate(
+            sizedOpportunity.expectedProfitUsd,
+            estimatedExecutionFeeUsd,
+            slippageCostUsd,
+            sizedOpportunity.estimatedNotionalUsd,
+          )
+        : {
+            passed: false,
+            netExpectedUsd: Number.NaN,
+            rejectReason: 'fee_estimate_unavailable',
+          };
 
       this.sessionMetrics.recordSlippageCost(slippageCostUsd);
       this.sessionMetrics.recordGateEvaluated();
