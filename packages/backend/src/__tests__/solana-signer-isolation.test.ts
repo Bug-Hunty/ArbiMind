@@ -6,10 +6,10 @@ describe('Solana trading signer isolation', () => {
   const tradingKey = bs58.encode(Keypair.generate().secretKey);
 
   it.each([
-    { SOLANA_TREASURY_SECRET_KEY: tradingKey },
-    { TREASURY_PRIVATE_KEY: tradingKey },
-    { SOLANA_PRIVATE_KEY_BASE58Y_BASE58: tradingKey },
-  ])('rejects non-trading credential %j', (env) => {
+    ['treasury', { SOLANA_TREASURY_SECRET_KEY: tradingKey }],
+    ['legacy treasury', { TREASURY_PRIVATE_KEY: tradingKey }],
+    ['legacy typo', { SOLANA_PRIVATE_KEY_BASE58Y_BASE58: tradingKey }],
+  ])('rejects non-trading credential: %s', (_label, env) => {
     expect(() => resolveTradingKeypairFromEnv(env)).toThrow('No trading keypair configured');
   });
 
