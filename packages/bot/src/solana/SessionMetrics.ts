@@ -6,6 +6,7 @@
  */
 
 import { Logger } from '../utils/Logger';
+import { EconomicsJournal, type JournalObservation } from './EconomicsJournal';
 
 const logger = new Logger('SessionMetrics');
 
@@ -108,6 +109,7 @@ export interface EconomicObservation {
   netExpectedUsd: number | null;
   usable: boolean;
   passed: boolean;
+  journal: JournalObservation;
 }
 
 export interface ReadinessHealth {
@@ -196,6 +198,8 @@ export interface ShadowSnapshot extends SessionSummary {
 export interface SessionMetricsConfig {
   /** How often to emit a summary log (ms). Default: 600_000 (10 min). */
   summaryIntervalMs: number;
+  economicsJournalPath?: string;
+  clock?: () => number;
 }
 
 const DEFAULT_CONFIG: SessionMetricsConfig = {
@@ -302,7 +306,8 @@ function summariseLatency(acc: LatencyAccumulator): LatencyStats {
 
 export class SessionMetrics {
   private readonly config: SessionMetricsConfig;
-  private readonly startedAt = Date.now();
+  private readonly clock: () => number;
+  private readonly startedAt: number;
   private summaryTimer: ReturnType<typeof setInterval> | null = null;
 
   // Funnel counters
@@ -380,6 +385,7 @@ export class SessionMetrics {
   private bestGrossPerPair: Record<string, number> = {};
   private bestGrossOverall = 0;
   private economicObservations: EconomicObservation[] = [];
+  private readonly economicsJournal: EconomicsJournal | null;
   private readinessHealth: ReadinessHealth = {
     feeEstimation: { attempted: 0, available: 0, unavailable: 0 },
     poolResolution: { configured: 0, resolved: 0, unresolved: 0 },
@@ -392,6 +398,15 @@ export class SessionMetrics {
 
   constructor(config?: Partial<SessionMetricsConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
+    this.clock = this.config.clock ?? (() => Date.now());
+    this.startedAt = this.clock();
+    this.economicsJournal = this.config.economicsJournalPath
+      ? new EconomicsJournal(this.config.economicsJournalPath)
+      : null;
+  }
+
+  nowMs(): number {
+    return this.clock();
   }
 
   // ── Recording methods ──────────────────────────────────────────
@@ -551,19 +566,69 @@ export class SessionMetrics {
     passed = false,
     timestampMs = Date.now(),
   ): void {
-    const usable = [grossUsd, executionFeeUsd, netEdgeUsd].every(Number.isFinite);
-    if (usable) {
-      this.grossUsdTotal += grossUsd;
-      this.executionFeeUsdTotal += executionFeeUsd;
-      this.netEdgeUsdTotal += netEdgeUsd;
+    this.recordEconomicsObservation({
+      schemaVersion: 1,
+      timestampMs,
+      poolAddress: null,
+      pair: 'unknown',
+      ammLabel: 'unknown',
+      routeType: 'unknown',
+      notionalUsd: 0,
+      expectedGrossUsd: grossUsd,
+      estimatedExecutionFeeUsd: Number.isFinite(executionFeeUsd) ? executionFeeUsd : null,
+      estimatedSlippageCostUsd: null,
+      riskBufferUsd: 0,
+      executionHaircutUsd: 0,
+      netExpectedUsd: Number.isFinite(netEdgeUsd) ? netEdgeUsd : null,
+      edgeBps: null,
+      quoteAgeMs: null,
+      feeEstimateAvailable: Number.isFinite(executionFeeUsd),
+      feeEstimateSource: null,
+      feeEstimateAgeMs: null,
+      passed,
+      rejectReason: passed ? null : 'unknown',
+      simulationAttempted: false,
+      simulationSucceeded: false,
+      simulationFailureReason: null,
+    });
+  }
+
+  recordEconomicsObservation(observation: JournalObservation): void {
+    const usable = [
+      observation.expectedGrossUsd,
+      observation.notionalUsd,
+      observation.netExpectedUsd,
+    ].every((value) => value === null || Number.isFinite(value));
+    if (
+      usable &&
+      Number.isFinite(observation.expectedGrossUsd) &&
+      observation.netExpectedUsd !== null &&
+      Number.isFinite(observation.netExpectedUsd)
+    ) {
+      this.grossUsdTotal += observation.expectedGrossUsd;
+      this.executionFeeUsdTotal += observation.estimatedExecutionFeeUsd ?? 0;
+      this.netEdgeUsdTotal += observation.netExpectedUsd;
       this.tradeCount++;
     }
+    const observationUsable = [
+      observation.expectedGrossUsd,
+      observation.notionalUsd,
+      observation.netExpectedUsd,
+    ].every((value) => value !== null && Number.isFinite(value));
     this.economicObservations.push({
-      timestampMs,
-      netExpectedUsd: Number.isFinite(netEdgeUsd) ? netEdgeUsd : null,
-      usable,
-      passed,
+      timestampMs: observation.timestampMs,
+      netExpectedUsd: observation.netExpectedUsd,
+      usable: observationUsable,
+      passed: observation.passed,
+      journal: { ...observation },
     });
+    try {
+      if (!this.economicsJournal) throw new Error('economics journal is not configured');
+      this.economicsJournal.append(observation);
+      this.recordObservationPersistence(true);
+    } catch {
+      this.recordObservationPersistence(false);
+    }
   }
 
   recordFeeEstimation(
@@ -653,7 +718,7 @@ export class SessionMetrics {
 
   getSummary(): SessionSummary {
     const funnel = this.getFunnelSnapshot();
-    const durationSec = (Date.now() - this.startedAt) / 1000;
+    const durationSec = (this.clock() - this.startedAt) / 1000;
 
     return {
       ...funnel,
@@ -705,7 +770,7 @@ export class SessionMetrics {
       ...this.getSummary(),
       schemaVersion: 1,
       startedAtIso: new Date(this.startedAt).toISOString(),
-      capturedAtIso: new Date().toISOString(),
+      capturedAtIso: new Date(this.clock()).toISOString(),
       quoteLatency: summariseLatency(this.quoteLatency),
       swapBuildLatency: summariseLatency(this.swapBuildLatency),
       rpc: {
