@@ -555,14 +555,22 @@ describe('shadow mode safety', () => {
      */
     it('lets a log-only run reach "ready for $1 canary" once enough evaluations accumulate', async () => {
       installFetchMock();
-      const metrics = new SessionMetrics();
+      let now = Date.now() - 25 * 60 * 60 * 1000;
+      const metrics = new SessionMetrics({
+        clock: () => now,
+        economicsJournalPath: `${process.env['TEMP'] ?? process.env['TMP'] ?? '.'}/arbimind-positive-${process.pid}.jsonl`,
+      });
       metrics.setAiScoringMode('local');
+      metrics.setReadinessProvenance('test-sha', 'test-sha');
+      metrics.setRequiredSafetyConfiguration(true);
+      metrics.recordPoolResolution(1, 1);
       const executor = new SolanaExecutor(makeConfig({ logOnly: true }), undefined, {
         gateConfig: PERMISSIVE_GATE,
         sessionMetrics: metrics,
       });
 
       for (let i = 0; i < READINESS.minGateEvaluations + 5; i++) {
+        now += 3_600_000 * 0.12;
         await executor.execute(makeOpportunity());
       }
 
@@ -572,25 +580,8 @@ describe('shadow mode safety', () => {
       expect(snap.avgNetEdgeUsd!).toBeGreaterThan(0);
       expect(snap.submitted).toBe(0);
 
-      const now = Date.now();
       const recommendation = deriveRecommendation({
         ...snap,
-        sessionDurationSec: 30 * 3600,
-        economicObservations: Array.from({ length: READINESS.minUsableObservations + 5 }, (_, index) => ({
-          timestampMs: now - 25 * 60 * 60 * 1000 + index * (25 * 60 * 60 * 1000 / (READINESS.minUsableObservations + 4)),
-          netExpectedUsd: snap.avgNetEdgeUsd,
-          usable: snap.avgNetEdgeUsd !== null,
-          passed: true,
-        })),
-        readinessHealth: {
-          feeEstimation: { attempted: 1, available: 1, unavailable: 0 },
-          poolResolution: { configured: 1, resolved: 1, unresolved: 0 },
-          observationPersistence: { attempted: 1, succeeded: 1, failed: 0 },
-          simulation: { attempted: 1, succeeded: 1, failed: 0 },
-          sourceSha: 'test-sha',
-          runtimeSha: 'test-sha',
-          requiredSafetyConfiguration: true,
-        },
       });
       expect(recommendation.verdict).toBe('ready for $1 canary');
     });
@@ -605,11 +596,16 @@ describe('shadow mode safety', () => {
         sessionMetrics: metrics,
       });
 
-      const result = await executor.execute(makeOpportunity());
+      const result = await executor.execute(makeOpportunity({
+        inputMint: USDC_MINT,
+        outputMint: USDC_MINT,
+        expectedProfitUsd: 1,
+      }));
 
-      expect(result.success).toBe(false);
-      expect(result.skipReason).toContain('fee_estimate_unavailable');
-      expect(metrics.getShadowSnapshot().economicObservations.at(-1)?.usable).toBe(false);
+      expect(result.skipped).toBe(true);
+      const snapshot = metrics.getShadowSnapshot();
+      expect(snapshot.readinessHealth.feeEstimation.unavailable).toBeGreaterThan(0);
+      expect(snapshot.economicObservations.at(-1)?.journal.feeEstimateAvailable).toBe(false);
       expect(sendTransaction).not.toHaveBeenCalled();
     });
 

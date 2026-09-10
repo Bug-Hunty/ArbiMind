@@ -16,6 +16,7 @@ import { LandingTracker } from './LandingTracker';
 import { NetEdgeAccumulator } from './NetEdgeAccumulator';
 import { resolveSpeedTierPolicy, type TierPolicy } from './SpeedTierPolicy';
 import { SessionMetrics } from './SessionMetrics';
+import { assertExecutionProvenance, readRuntimeProvenance } from './RuntimeProvenance';
 import { Connection, Keypair } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -153,11 +154,16 @@ export class SolanaScanner {
 
     // Session metrics — funnel counters, periodic summary
     const summaryIntervalMs = Number(process.env['SESSION_SUMMARY_INTERVAL_MS'] || '600000');
-    this.sessionMetrics = new SessionMetrics({ summaryIntervalMs });
+    this.sessionMetrics = new SessionMetrics({
+      summaryIntervalMs,
+      economicsJournalPath: process.env['SOLANA_ECONOMICS_JOURNAL_PATH'] ?? 'shadow-economics.jsonl',
+    });
     this.sessionMetrics.setAiScoringMode(config.aiScoringMode);
+    const provenance = readRuntimeProvenance();
+    assertExecutionProvenance(provenance, solanaExecutorConfig.logOnly);
     this.sessionMetrics.setReadinessProvenance(
-      process.env['ARBIMIND_SOURCE_SHA'] ?? process.env['GIT_SHA'] ?? null,
-      process.env['ARBIMIND_RUNTIME_SHA'] ?? process.env['GIT_SHA'] ?? null,
+      provenance.sourceSha,
+      provenance.runtimeSha,
     );
     this.sessionMetrics.setRequiredSafetyConfiguration(solanaExecutorConfig.logOnly);
 
