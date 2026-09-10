@@ -18,6 +18,7 @@ import type { ShadowSnapshot } from '../../src/solana/SessionMetrics';
 /** A snapshot that satisfies every readiness criterion. */
 function healthySnapshot(overrides: Partial<ShadowSnapshot> = {}): ShadowSnapshot {
   const base = new SessionMetrics().getShadowSnapshot();
+  const now = Date.now();
   return {
     ...base,
     sessionDurationSec: 30 * 3600,
@@ -44,11 +45,68 @@ function healthySnapshot(overrides: Partial<ShadowSnapshot> = {}): ShadowSnapsho
       actionable: 400,
       belowConfidence: 600,
     },
+    economicObservations: Array.from({ length: 500 }, (_, index) => ({
+      timestampMs: now - (25 * 60 * 60 * 1000) + index * (25 * 60 * 60 * 1000 / 499),
+      netExpectedUsd: 0.15,
+      usable: true,
+      passed: index < 100,
+    })),
+    readinessHealth: {
+      feeEstimation: { attempted: 500, available: 500, unavailable: 0 },
+      poolResolution: { configured: 5, resolved: 5, unresolved: 0 },
+      observationPersistence: { attempted: 500, succeeded: 500, failed: 0 },
+      simulation: { attempted: 100, succeeded: 100, failed: 0 },
+      sourceSha: 'test-sha',
+      runtimeSha: 'test-sha',
+      requiredSafetyConfiguration: true,
+    },
     ...overrides,
   };
 }
 
 describe('deriveRecommendation', () => {
+  it('rejects a high-count population concentrated in one hour', () => {
+    const now = Date.now();
+    const rec = deriveRecommendation(healthySnapshot({
+      economicObservations: Array.from({ length: 200 }, (_, index) => ({
+        timestampMs: now - 30 * 60 * 1000 + index * 1500,
+        netExpectedUsd: 0.15,
+        usable: true,
+        passed: true,
+      })),
+    }));
+    expect(rec.verdict).toBe('not ready');
+    expect(rec.reasons.join(' ')).toContain('time coverage');
+  });
+
+  it('rejects a positive point estimate when the confidence bound is below the floor', () => {
+    const now = Date.now();
+    const rec = deriveRecommendation(healthySnapshot({
+      economicObservations: Array.from({ length: 500 }, (_, index) => ({
+        timestampMs: now - 25 * 60 * 60 * 1000 + index * (25 * 60 * 60 * 1000 / 499),
+        netExpectedUsd: index < 498 ? 0 : 10,
+        usable: true,
+        passed: true,
+      })),
+    }));
+    expect(rec.verdict).toBe('tune thresholds');
+    expect(rec.reasons.join(' ')).toContain('lower 95% confidence bound');
+    expect(rec.reasons.join(' ')).toContain('all-evaluation mean');
+  });
+
+  it.each([
+    ['fee estimation', { feeEstimation: { attempted: 10, available: 0, unavailable: 10 } }],
+    ['pool resolution', { poolResolution: { configured: 2, resolved: 1, unresolved: 1 } }],
+    ['observation persistence', { observationPersistence: { attempted: 10, succeeded: 9, failed: 1 } }],
+  ])('fails closed when %s health is bad', (_name, healthOverride) => {
+    const base = healthySnapshot();
+    const rec = deriveRecommendation({
+      ...base,
+      readinessHealth: { ...base.readinessHealth, ...healthOverride },
+    });
+    expect(rec.verdict).toBe('not ready');
+  });
+
   describe('contaminated run disqualification', () => {
     it('returns "not ready" when any transaction was submitted', () => {
       // An otherwise perfect run: every readiness criterion met.
@@ -121,16 +179,26 @@ describe('deriveRecommendation', () => {
 
   it('returns "continue shadow" when the window is too short', () => {
     const rec = deriveRecommendation(healthySnapshot({ sessionDurationSec: 3 * 3600 }));
-    expect(rec.verdict).toBe('continue shadow');
+    expect(rec.verdict).toBe('not ready');
     expect(rec.reasons.join(' ')).toContain('under the');
   });
 
   it('returns "continue shadow" when there are too few gate evaluations', () => {
     const rec = deriveRecommendation(
-      healthySnapshot({ gateEvaluated: 10, gatePassed: 5, gateRejected: 5 }),
+      healthySnapshot({
+        gateEvaluated: 10,
+        gatePassed: 5,
+        gateRejected: 5,
+        economicObservations: Array.from({ length: 10 }, (_, index) => ({
+          timestampMs: Date.now() - 25 * 60 * 60 * 1000 + index * 9_000_000,
+          netExpectedUsd: 0.15,
+          usable: true,
+          passed: true,
+        })),
+      }),
     );
-    expect(rec.verdict).toBe('continue shadow');
-    expect(rec.reasons.join(' ')).toContain('gate evaluations');
+    expect(rec.verdict).toBe('not ready');
+    expect(rec.reasons.join(' ')).toContain('usable observations');
   });
 
   it('returns "tune thresholds" when the gate rejects nearly everything', () => {
@@ -147,15 +215,26 @@ describe('deriveRecommendation', () => {
   });
 
   it('returns "tune thresholds" when passing trades are too marginal', () => {
-    const rec = deriveRecommendation(healthySnapshot({ avgNetEdgeUsd: 0.001 }));
+    const rec = deriveRecommendation(healthySnapshot({
+      avgNetEdgeUsd: 0.001,
+      economicObservations: Array.from({ length: 500 }, (_, index) => ({
+        timestampMs: Date.now() - 25 * 60 * 60 * 1000 + index * 180_000,
+        netExpectedUsd: 0.001,
+        usable: true,
+        passed: true,
+      })),
+    }));
     expect(rec.verdict).toBe('tune thresholds');
-    expect(rec.reasons.join(' ')).toContain('below the');
+    expect(rec.reasons.join(' ')).toContain('lower 95% confidence bound');
   });
 
   it('returns "tune thresholds" when net edge is unknown', () => {
     // A null average must never be read as "fine".
-    const rec = deriveRecommendation(healthySnapshot({ avgNetEdgeUsd: null }));
-    expect(rec.verdict).toBe('tune thresholds');
+    const rec = deriveRecommendation(healthySnapshot({
+      avgNetEdgeUsd: null,
+      economicObservations: [],
+    }));
+    expect(rec.verdict).toBe('not ready');
   });
 
   it('recommends a canary only when every criterion is met', () => {
@@ -174,11 +253,19 @@ describe('deriveRecommendation', () => {
     // Degrade one dimension at a time; none may still yield a canary verdict.
     const degradations: Array<Partial<ShadowSnapshot>> = [
       { sessionDurationSec: (READINESS.minWindowHours - 1) * 3600 },
-      { gateEvaluated: READINESS.minGateEvaluations - 1 },
+      { gateEvaluated: READINESS.minGateEvaluations - 1, economicObservations: [] },
       { gatePassed: READINESS.minGatePassed - 1 },
       { swapBuildsAttempted: 100, swapsBuilt: 80, swapBuildFailed: 20 },
       { quotesRequested: 1_000, quoteFailures: 500 },
-      { avgNetEdgeUsd: 0 },
+      {
+        avgNetEdgeUsd: 0,
+        economicObservations: Array.from({ length: 500 }, (_, index) => ({
+          timestampMs: Date.now() - 25 * 60 * 60 * 1000 + index * 180_000,
+          netExpectedUsd: 0,
+          usable: true,
+          passed: true,
+        })),
+      },
     ];
     for (const degradation of degradations) {
       const rec = deriveRecommendation(healthySnapshot(degradation));
@@ -206,6 +293,10 @@ describe('renderShadowReport', () => {
       'realized economics',
       'risk notes:',
       'recommendation:',
+      'STATISTICAL READINESS:',
+      'confidence method:',
+      'lower confidence bound:',
+      'required floor:',
     ]) {
       expect(report).toContain(section);
     }

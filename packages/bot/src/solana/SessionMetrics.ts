@@ -103,6 +103,23 @@ export interface AiScoringCounters {
   belowConfidence: number;
 }
 
+export interface EconomicObservation {
+  timestampMs: number;
+  netExpectedUsd: number | null;
+  usable: boolean;
+  passed: boolean;
+}
+
+export interface ReadinessHealth {
+  feeEstimation: { attempted: number; available: number; unavailable: number };
+  poolResolution: { configured: number; resolved: number; unresolved: number };
+  observationPersistence: { attempted: number; succeeded: number; failed: number };
+  simulation: { attempted: number; succeeded: number; failed: number };
+  sourceSha: string | null;
+  runtimeSha: string | null;
+  requiredSafetyConfiguration: boolean | null;
+}
+
 export interface FeeNormStats {
   count: number;
   totalFeeBps: number;
@@ -161,6 +178,9 @@ export interface ShadowSnapshot extends SessionSummary {
   routeTypes: Record<string, number>;
   bestGrossOverallUsd: number;
   bestGrossPerPair: Record<string, number>;
+  /** Individual gate observations are the statistical readiness population. */
+  economicObservations: EconomicObservation[];
+  readinessHealth: ReadinessHealth;
 }
 
 // ── Config ─────────────────────────────────────────────────────────
@@ -351,6 +371,16 @@ export class SessionMetrics {
   // Best gross edge per pair (reset each summary interval)
   private bestGrossPerPair: Record<string, number> = {};
   private bestGrossOverall = 0;
+  private economicObservations: EconomicObservation[] = [];
+  private readinessHealth: ReadinessHealth = {
+    feeEstimation: { attempted: 0, available: 0, unavailable: 0 },
+    poolResolution: { configured: 0, resolved: 0, unresolved: 0 },
+    observationPersistence: { attempted: 0, succeeded: 0, failed: 0 },
+    simulation: { attempted: 0, succeeded: 0, failed: 0 },
+    sourceSha: null,
+    runtimeSha: null,
+    requiredSafetyConfiguration: null,
+  };
 
   constructor(config?: Partial<SessionMetricsConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -506,11 +536,52 @@ export class SessionMetrics {
   }
 
   /** Expected trade economics, recorded at gate evaluation (see #411). */
-  recordExpectedTradeEconomics(grossUsd: number, executionFeeUsd: number, netEdgeUsd: number): void {
+  recordExpectedTradeEconomics(
+    grossUsd: number,
+    executionFeeUsd: number,
+    netEdgeUsd: number,
+    passed = false,
+    timestampMs = Date.now(),
+  ): void {
     this.grossUsdTotal += grossUsd;
     this.executionFeeUsdTotal += executionFeeUsd;
     this.netEdgeUsdTotal += netEdgeUsd;
     this.tradeCount++;
+    this.economicObservations.push({
+      timestampMs,
+      netExpectedUsd: Number.isFinite(netEdgeUsd) ? netEdgeUsd : null,
+      usable: Number.isFinite(netEdgeUsd),
+      passed,
+    });
+  }
+
+  recordFeeEstimation(available: boolean): void {
+    this.readinessHealth.feeEstimation.attempted++;
+    if (available) this.readinessHealth.feeEstimation.available++;
+    else this.readinessHealth.feeEstimation.unavailable++;
+  }
+
+  recordPoolResolution(configured: number, resolved: number): void {
+    this.readinessHealth.poolResolution = {
+      configured,
+      resolved,
+      unresolved: Math.max(0, configured - resolved),
+    };
+  }
+
+  recordObservationPersistence(success: boolean): void {
+    this.readinessHealth.observationPersistence.attempted++;
+    if (success) this.readinessHealth.observationPersistence.succeeded++;
+    else this.readinessHealth.observationPersistence.failed++;
+  }
+
+  setReadinessProvenance(sourceSha: string | null, runtimeSha: string | null): void {
+    this.readinessHealth.sourceSha = sourceSha;
+    this.readinessHealth.runtimeSha = runtimeSha;
+  }
+
+  setRequiredSafetyConfiguration(valid: boolean): void {
+    this.readinessHealth.requiredSafetyConfiguration = valid;
   }
 
   /**
@@ -635,6 +706,16 @@ export class SessionMetrics {
       routeTypes: { ...this.routeTypes },
       bestGrossOverallUsd: +this.bestGrossOverall.toFixed(6),
       bestGrossPerPair: { ...this.bestGrossPerPair },
+      economicObservations: this.economicObservations.map((observation) => ({ ...observation })),
+      readinessHealth: {
+        feeEstimation: { ...this.readinessHealth.feeEstimation },
+        poolResolution: { ...this.readinessHealth.poolResolution },
+        observationPersistence: { ...this.readinessHealth.observationPersistence },
+        simulation: { ...this.readinessHealth.simulation },
+        sourceSha: this.readinessHealth.sourceSha,
+        runtimeSha: this.readinessHealth.runtimeSha,
+        requiredSafetyConfiguration: this.readinessHealth.requiredSafetyConfiguration,
+      },
     };
   }
 

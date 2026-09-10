@@ -11,7 +11,7 @@
 
 import { promises as fs } from 'fs';
 import path from 'path';
-import type { SessionMetrics, ShadowSnapshot } from './SessionMetrics';
+import type { EconomicObservation, SessionMetrics, ShadowSnapshot } from './SessionMetrics';
 
 // ── Readiness thresholds ───────────────────────────────────────────
 
@@ -33,6 +33,14 @@ export const READINESS = {
   /** Quote failures above this fraction mean the data feed is unreliable. */
   maxQuoteFailureRate: 0.05,
   /** Net expected profit must be positive by a margin, not marginally. */
+  minEconomicFloorUsd: 0.02,
+  /** A confidence interval is not credible below this usable population. */
+  minUsableObservations: 200,
+  /** Require observations in at least half of the 24 hourly buckets. */
+  minHourlyBuckets: 12,
+  maxRpcFailureRate: 0.05,
+  maxSnapshotAgeHours: 36,
+  /** Compatibility alias; readiness uses the confidence bound instead. */
   minAvgNetEdgeUsd: 0.02,
 } as const;
 
@@ -75,6 +83,99 @@ function topN(counts: Record<string, number>, n: number): string[] {
     .map(([label, count]) => `${label}=${count}`);
 }
 
+export interface EconomicStatistics {
+  sampleCount: number;
+  mean: number | null;
+  median: number | null;
+  standardDeviation: number | null;
+  p10: number | null;
+  p25: number | null;
+  p50: number | null;
+  p75: number | null;
+  p90: number | null;
+  confidenceInterval: [number, number] | null;
+  lowerConfidenceBound: number | null;
+}
+
+function quantile(values: number[], fraction: number): number | null {
+  if (values.length === 0) return null;
+  const position = (values.length - 1) * fraction;
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  if (lower === upper) return values[lower];
+  return values[lower] + (values[upper] - values[lower]) * (position - lower);
+}
+
+/**
+ * Deterministic percentile bootstrap for the mean. Resampling the complete
+ * ALL-evaluations population avoids treating winners as representative. A
+ * fixed LCG makes reports reproducible and keeps tests independent of runtime
+ * randomness; the lower percentile is the readiness bound.
+ */
+export function calculateEconomicStatistics(observations: EconomicObservation[]): EconomicStatistics {
+  const values = observations
+    .filter((observation) => observation.usable && observation.netExpectedUsd !== null)
+    .map((observation) => observation.netExpectedUsd as number)
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b);
+  if (values.length < READINESS.minUsableObservations) {
+    return {
+      sampleCount: values.length,
+      mean: null,
+      median: quantile(values, 0.5),
+      standardDeviation: null,
+      p10: quantile(values, 0.1),
+      p25: quantile(values, 0.25),
+      p50: quantile(values, 0.5),
+      p75: quantile(values, 0.75),
+      p90: quantile(values, 0.9),
+      confidenceInterval: null,
+      lowerConfidenceBound: null,
+    };
+  }
+  const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+  const variance = values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / (values.length - 1);
+  let state = 0x9e3779b9;
+  const bootstrapMeans: number[] = [];
+  for (let sample = 0; sample < 2_000; sample++) {
+    let total = 0;
+    for (let index = 0; index < values.length; index++) {
+      state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+      total += values[state % values.length];
+    }
+    bootstrapMeans.push(total / values.length);
+  }
+  bootstrapMeans.sort((a, b) => a - b);
+  return {
+    sampleCount: values.length,
+    mean,
+    median: quantile(values, 0.5),
+    standardDeviation: Math.sqrt(variance),
+    p10: quantile(values, 0.1),
+    p25: quantile(values, 0.25),
+    p50: quantile(values, 0.5),
+    p75: quantile(values, 0.75),
+    p90: quantile(values, 0.9),
+    confidenceInterval: [quantile(bootstrapMeans, 0.025)!, quantile(bootstrapMeans, 0.975)!],
+    lowerConfidenceBound: quantile(bootstrapMeans, 0.025),
+  };
+}
+
+function temporalCoverage(snapshot: ShadowSnapshot): { elapsedHours: number; hourlyBuckets: number; largestConcentration: number } {
+  const timestamps = snapshot.economicObservations.map((observation) => observation.timestampMs).filter(Number.isFinite);
+  if (timestamps.length === 0) return { elapsedHours: 0, hourlyBuckets: 0, largestConcentration: 0 };
+  const buckets = new Map<number, number>();
+  timestamps.forEach((timestamp) => {
+    const bucket = Math.floor(timestamp / 3_600_000);
+    buckets.set(bucket, (buckets.get(bucket) ?? 0) + 1);
+  });
+  return {
+    elapsedHours: (Math.max(...timestamps) - Math.min(...timestamps)) / 3_600_000,
+    hourlyBuckets: buckets.size,
+    largestConcentration: Math.max(...buckets.values()) / timestamps.length,
+  };
+}
+
 // ── Recommendation ─────────────────────────────────────────────────
 
 /**
@@ -86,12 +187,14 @@ function topN(counts: Record<string, number>, n: number): string[] {
  * treated as a passing run.
  */
 export function deriveRecommendation(snapshot: ShadowSnapshot): ShadowRecommendation {
-  const reasons: string[] = [];
   const windowHours = snapshot.sessionDurationSec / 3600;
 
   const quoteFailureRate = rate(snapshot.quoteFailures, snapshot.quotesRequested);
   const swapBuildSuccessRate = rate(snapshot.swapsBuilt, snapshot.swapBuildsAttempted);
   const gatePassRate = rate(snapshot.gatePassed, snapshot.gateEvaluated);
+  const coverage = temporalCoverage(snapshot);
+  const statistics = calculateEconomicStatistics(snapshot.economicObservations ?? []);
+  const health = snapshot.readinessHealth;
 
   // --- Hard blockers: something is wrong with the pipeline itself. ---
   const blockers: string[] = [];
@@ -101,16 +204,7 @@ export function deriveRecommendation(snapshot: ShadowSnapshot): ShadowRecommenda
   // readiness conclusion may be drawn from it. Flagging this in the report body
   // is not enough -- an advisory marker beside a "READY" verdict is exactly the
   // kind of signal that gets read as success.
-  if (snapshot.submitted > 0) {
-    return {
-      verdict: 'not ready',
-      reasons: [
-        `shadow run was contaminated by ${snapshot.submitted} live submission(s) — SOLANA_LOG_ONLY was not true`,
-        'discard this run: its metrics do not describe log-only behaviour',
-        'no canary readiness conclusion can be drawn from a contaminated run',
-      ],
-    };
-  }
+  if (snapshot.submitted > 0) blockers.push(`shadow run contaminated by ${snapshot.submitted} submitted transaction(s) — SOLANA_LOG_ONLY was not true`);
 
   // AI scoring blockers. Every opportunity is gated on a score existing, so an
   // unscored run produces zeros through the whole executor funnel. Reporting
@@ -132,9 +226,7 @@ export function deriveRecommendation(snapshot: ShadowSnapshot): ShadowRecommenda
     }
   }
 
-  if (snapshot.quotesRequested === 0) {
-    blockers.push('no quotes were requested — scanner or executor never reached the quote stage');
-  }
+  if (snapshot.quotesRequested === 0) blockers.push('no quotes were requested — scanner never reached the quote stage');
   if (quoteFailureRate !== null && quoteFailureRate > READINESS.maxQuoteFailureRate) {
     blockers.push(
       `quote failure rate ${pct(quoteFailureRate)} exceeds ${pct(READINESS.maxQuoteFailureRate)} — data feed unreliable`,
@@ -149,33 +241,29 @@ export function deriveRecommendation(snapshot: ShadowSnapshot): ShadowRecommenda
       `swap build success rate ${pct(swapBuildSuccessRate)} below ${pct(READINESS.minSwapBuildSuccessRate)}`,
     );
   }
-  if (snapshot.rpc.rateLimited > 0 && snapshot.quotesRequested > 0) {
-    const rlRate = snapshot.rpc.rateLimited / snapshot.quotesRequested;
-    if (rlRate > 0.02) {
-      blockers.push(
-        `RPC rate limiting on ${pct(rlRate)} of quotes — reduce scan rate before adding live execution`,
-      );
-    }
+  const rpcRate = rate(snapshot.rpc.errors + snapshot.rpc.rateLimited + snapshot.rpc.latencyFailures, snapshot.quotesRequested);
+  if (rpcRate === null || rpcRate > READINESS.maxRpcFailureRate) blockers.push(`RPC failure/rate limiting rate ${pct(rpcRate)} is unavailable or exceeds ${pct(READINESS.maxRpcFailureRate)}`);
+  if (health === undefined) blockers.push('readiness health is absent (legacy snapshot)');
+  else {
+    const feeRate = rate(health.feeEstimation.unavailable, health.feeEstimation.attempted);
+    if (feeRate === null || feeRate > 0.05) blockers.push('fee estimation is unavailable or outside tolerance');
+    if (health.poolResolution.configured <= 0 || health.poolResolution.unresolved > 0) blockers.push('configured pools are unresolved');
+    if (health.observationPersistence.attempted <= 0 || health.observationPersistence.failed > 0) blockers.push('observation persistence is not healthy');
+    if (health.simulation.failed > 0) blockers.push('quote/build/simulation failures were recorded');
+    if (health.sourceSha === null || health.runtimeSha === null || health.sourceSha !== health.runtimeSha) blockers.push('runtime/source SHA provenance is missing or mismatched');
+    if (health.requiredSafetyConfiguration !== true) blockers.push('required safety configuration is missing or invalid');
   }
 
   if (blockers.length > 0) {
     return { verdict: 'not ready', reasons: blockers };
   }
 
-  // --- Insufficient evidence: the run is fine, just not conclusive yet. ---
-  if (windowHours < READINESS.minWindowHours) {
-    reasons.push(
-      `window ${windowHours.toFixed(1)}h is under the ${READINESS.minWindowHours}h minimum`,
-    );
-  }
-  if (snapshot.gateEvaluated < READINESS.minGateEvaluations) {
-    reasons.push(
-      `only ${snapshot.gateEvaluated} gate evaluations (need ${READINESS.minGateEvaluations}) — pass rate is not yet statistically meaningful`,
-    );
-  }
-  if (reasons.length > 0) {
-    return { verdict: 'continue shadow', reasons };
-  }
+  if (windowHours < READINESS.minWindowHours) blockers.push(`window ${windowHours.toFixed(1)}h is under the ${READINESS.minWindowHours}h minimum`);
+  if (statistics.sampleCount < READINESS.minUsableObservations) blockers.push(`only ${statistics.sampleCount} usable observations (need ${READINESS.minUsableObservations})`);
+  if (coverage.elapsedHours < READINESS.minWindowHours || coverage.hourlyBuckets < READINESS.minHourlyBuckets) blockers.push(`time coverage is insufficient: ${coverage.hourlyBuckets} hourly buckets across ${coverage.elapsedHours.toFixed(1)}h`);
+  const capturedAgeHours = (Date.now() - Date.parse(snapshot.capturedAtIso)) / 3_600_000;
+  if (!Number.isFinite(capturedAgeHours) || capturedAgeHours < 0 || capturedAgeHours > READINESS.maxSnapshotAgeHours) blockers.push('snapshot is stale or has an invalid capture time');
+  if (blockers.length > 0) return { verdict: 'not ready', reasons: blockers };
 
   // --- Enough evidence: is the economics actually favourable? ---
   if (snapshot.gatePassed < READINESS.minGatePassed) {
@@ -188,12 +276,12 @@ export function deriveRecommendation(snapshot: ShadowSnapshot): ShadowRecommenda
       ],
     };
   }
-  if (snapshot.avgNetEdgeUsd === null || snapshot.avgNetEdgeUsd < READINESS.minAvgNetEdgeUsd) {
+  if (statistics.lowerConfidenceBound === null || statistics.lowerConfidenceBound < READINESS.minEconomicFloorUsd) {
     return {
       verdict: 'tune thresholds',
       reasons: [
-        `average net expected profit ${usd(snapshot.avgNetEdgeUsd)} is below the ${usd(READINESS.minAvgNetEdgeUsd)} margin`,
-        'passing trades are too marginal to survive real execution drag',
+        `lower 95% confidence bound ${usd(statistics.lowerConfidenceBound)} does not clear ${usd(READINESS.minEconomicFloorUsd)}`,
+        `all-evaluation mean is ${usd(statistics.mean)}; point estimate alone cannot establish readiness`,
       ],
     };
   }
@@ -201,10 +289,10 @@ export function deriveRecommendation(snapshot: ShadowSnapshot): ShadowRecommenda
   return {
     verdict: 'ready for $1 canary',
     reasons: [
-      `${windowHours.toFixed(1)}h window with ${snapshot.gateEvaluated} gate evaluations`,
+      `${windowHours.toFixed(1)}h window with ${statistics.sampleCount} usable observations across ${coverage.hourlyBuckets} hourly buckets`,
       `gate pass rate ${pct(gatePassRate)} (${snapshot.gatePassed} passed)`,
       `swap build success ${pct(swapBuildSuccessRate)}`,
-      `average net expected profit ${usd(snapshot.avgNetEdgeUsd)}`,
+      `all-evaluation mean ${usd(statistics.mean)} with lower 95% bound ${usd(statistics.lowerConfidenceBound)}`,
       'shadow evidence supports a manually-reviewed $1 canary — this is a recommendation, not an authorisation',
     ],
   };
@@ -326,6 +414,26 @@ export function renderShadowReport(snapshot: ShadowSnapshot): string {
   lines.push('        these are estimates, not realized PnL, and populate in log-only mode');
   lines.push('');
 
+  const coverage = temporalCoverage(snapshot);
+  const statistics = calculateEconomicStatistics(snapshot.economicObservations ?? []);
+  lines.push('STATISTICAL READINESS:');
+  push('duration:', `${windowHours.toFixed(2)}h`);
+  push('observation count:', String(snapshot.economicObservations?.length ?? 0));
+  push('usable observation count:', String(statistics.sampleCount));
+  push('hourly coverage:', `${coverage.hourlyBuckets} buckets / ${coverage.elapsedHours.toFixed(2)}h`);
+  push('largest concentration:', pct(coverage.largestConcentration));
+  push('confidence method:', 'deterministic percentile bootstrap (95%)');
+  push('mean net edge (ALL):', usd(statistics.mean));
+  push('median net edge:', usd(statistics.median));
+  push('p10 / p90:', `${usd(statistics.p10)} / ${usd(statistics.p90)}`);
+  push('95% CI:', statistics.confidenceInterval ? `${usd(statistics.confidenceInterval[0])} to ${usd(statistics.confidenceInterval[1])}` : 'n/a');
+  push('lower confidence bound:', usd(statistics.lowerConfidenceBound));
+  push('required floor:', usd(READINESS.minEconomicFloorUsd));
+  lines.push('  infrastructure blockers: reported by readiness health');
+  lines.push('  economic blockers: lower confidence bound must clear required floor');
+  lines.push('  data-quality blockers: usable observations and temporal coverage are required');
+  lines.push('');
+
   lines.push('realized economics (confirmed live submissions only):');
   if (snapshot.realizedTradeCount > 0) {
     push('trades confirmed', String(snapshot.realizedTradeCount));
@@ -347,7 +455,10 @@ export function renderShadowReport(snapshot: ShadowSnapshot): string {
   lines.push('');
 
   lines.push('recommendation:');
-  lines.push(`  ${recommendation.verdict.toUpperCase()}`);
+  const displayedVerdict = recommendation.verdict === 'ready for $1 canary'
+    ? 'READY FOR MANUAL CANARY REVIEW'
+    : recommendation.verdict.toUpperCase();
+  lines.push(`  ${displayedVerdict}`);
   recommendation.reasons.forEach((r) => lines.push(`    - ${r}`));
   lines.push('');
 
@@ -374,12 +485,18 @@ export class ShadowSnapshotWriter {
   ) {}
 
   async writeOnce(): Promise<void> {
-    const snapshot = this.metrics.getShadowSnapshot();
-    const dir = path.dirname(this.filePath);
-    await fs.mkdir(dir, { recursive: true });
-    const tmp = `${this.filePath}.tmp`;
-    await fs.writeFile(tmp, JSON.stringify(snapshot, null, 2), 'utf8');
-    await fs.rename(tmp, this.filePath);
+    try {
+      const snapshot = this.metrics.getShadowSnapshot();
+      const dir = path.dirname(this.filePath);
+      await fs.mkdir(dir, { recursive: true });
+      const tmp = `${this.filePath}.tmp`;
+      await fs.writeFile(tmp, JSON.stringify(snapshot, null, 2), 'utf8');
+      await fs.rename(tmp, this.filePath);
+      this.metrics.recordObservationPersistence(true);
+    } catch (error) {
+      this.metrics.recordObservationPersistence(false);
+      throw error;
+    }
   }
 
   start(): void {

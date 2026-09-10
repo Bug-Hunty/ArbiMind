@@ -571,7 +571,26 @@ describe('shadow mode safety', () => {
       expect(snap.avgNetEdgeUsd!).toBeGreaterThan(0);
       expect(snap.submitted).toBe(0);
 
-      const recommendation = deriveRecommendation({ ...snap, sessionDurationSec: 30 * 3600 });
+      const now = Date.now();
+      const recommendation = deriveRecommendation({
+        ...snap,
+        sessionDurationSec: 30 * 3600,
+        economicObservations: Array.from({ length: READINESS.minUsableObservations + 5 }, (_, index) => ({
+          timestampMs: now - 25 * 60 * 60 * 1000 + index * (25 * 60 * 60 * 1000 / (READINESS.minUsableObservations + 4)),
+          netExpectedUsd: snap.avgNetEdgeUsd,
+          usable: snap.avgNetEdgeUsd !== null,
+          passed: true,
+        })),
+        readinessHealth: {
+          feeEstimation: { attempted: 1, available: 1, unavailable: 0 },
+          poolResolution: { configured: 1, resolved: 1, unresolved: 0 },
+          observationPersistence: { attempted: 1, succeeded: 1, failed: 0 },
+          simulation: { attempted: 1, succeeded: 1, failed: 0 },
+          sourceSha: 'test-sha',
+          runtimeSha: 'test-sha',
+          requiredSafetyConfiguration: true,
+        },
+      });
       expect(recommendation.verdict).toBe('ready for $1 canary');
     });
   });
