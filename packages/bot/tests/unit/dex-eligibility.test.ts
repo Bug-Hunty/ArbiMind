@@ -1,4 +1,8 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
+
+// Load the external SDK in setup; the config itself must still be imported
+// after each test's environment changes. Cold disk I/O is not a gate timeout.
+beforeAll(async () => { await import('ethers'); }, 60_000);
 
 describe('getEligibleDexesForPair', () => {
   const originalEnv = { ...process.env };
@@ -8,8 +12,11 @@ describe('getEligibleDexesForPair', () => {
   });
 
   afterEach(() => {
-    process.env = { ...originalEnv };
-    delete process.env['PAIR_DEX_OVERRIDE'];
+    // Preserve the process.env object shared with env-sensitive modules.
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) delete process.env[key];
+    }
+    Object.assign(process.env, originalEnv);
   });
 
   function setArbitrumProfile() {

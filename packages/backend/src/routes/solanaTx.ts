@@ -126,9 +126,8 @@ function tryDecodeBase64(value: string): Uint8Array {
 
 function parseTreasuryDiagnostics(): TreasuryDiagnostics {
   const treasuryRaw = process.env.SOLANA_TREASURY_SECRET_KEY;
-  const legacyRaw = process.env.SOLANA_ARB_SECRET_KEY;
-  const selectedRaw = treasuryRaw ?? legacyRaw ?? '';
-  const envVarSeen = typeof treasuryRaw === 'string' || typeof legacyRaw === 'string';
+  const selectedRaw = treasuryRaw ?? '';
+  const envVarSeen = typeof treasuryRaw === 'string';
   const normalized = normalizeSecretInput(selectedRaw);
 
   if (!normalized) {

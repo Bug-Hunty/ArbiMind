@@ -7,14 +7,15 @@
     "buildCommand": "npm run build --workspace=@arbimind/bot || npm run build"
   },
   "deploy": {
-    "startCommand": "node dist/index.js"
+    "startCommand": "npm start"
   },
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
     "dev": "tsx watch src/index.ts",
     "canary": "tsx src/canary.ts",
-    "start": "node dist/index.js",
+    "start": "node scripts/start.cjs",
+    "image:build": "node scripts/build-image.cjs",
     "test": "vitest run",
     "test:ui": "vitest --ui",
     "test:watch": "vitest --watch",

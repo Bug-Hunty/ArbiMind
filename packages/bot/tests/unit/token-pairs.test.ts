@@ -1,4 +1,6 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
+
+beforeAll(async () => { await import('ethers'); }, 60_000);
 
 describe('getEffectiveTokenPairs', () => {
   const originalEnv = { ...process.env };
@@ -8,7 +10,11 @@ describe('getEffectiveTokenPairs', () => {
   });
 
   afterEach(() => {
-    process.env = { ...originalEnv };
+    // Preserve the process.env object shared with env-sensitive modules.
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) delete process.env[key];
+    }
+    Object.assign(process.env, originalEnv);
   });
 
   function setArbitrumProfile() {

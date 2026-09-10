@@ -12,6 +12,11 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+// Assertions use execution counters and spies, not production log files.
+vi.mock('../../src/utils/Logger', () => ({ Logger: class {
+  info = vi.fn(); warn = vi.fn(); error = vi.fn(); debug = vi.fn();
+} }));
+
 // ── Solana web3 stub ───────────────────────────────────────────────
 // Connection and VersionedTransaction are replaced; Keypair/PublicKey stay
 // real so signer loading exercises the production code path.
@@ -274,18 +279,15 @@ describe('shadow mode safety', () => {
       expect(sendTransaction).not.toHaveBeenCalled();
     });
 
-    it('missing wallet key skips before live execution', async () => {
+    it('missing trading signer fails construction before any execution I/O', () => {
       const fetchMock = installFetchMock();
-      const executor = new SolanaExecutor(
+      expect(() => new SolanaExecutor(
         makeConfig({ privateKeyBase58: '', logOnly: false, tradingEnabled: true }),
-      );
-
-      const result = await executor.execute(makeOpportunity());
-
-      expect(result.skipped).toBe(true);
-      expect(result.skipReason).toContain('SOLANA_PRIVATE_KEY_BASE58');
+      )).toThrow('Missing SOLANA_PRIVATE_KEY_BASE58');
       expect(fetchMock).not.toHaveBeenCalled();
       expect(sendTransaction).not.toHaveBeenCalled();
+      expect(confirmTransaction).not.toHaveBeenCalled();
+      expect(signedTransaction.sign).not.toHaveBeenCalled();
     });
 
     it('notional cap rejects oversized opportunities before quoting', async () => {

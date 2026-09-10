@@ -168,12 +168,8 @@ export const solanaExecutorConfig: SolanaExecutorRuntimeConfig = {
     process.env['SOLANA_RPC_URL_MAINNET_BETA'] ||
     process.env['SOLANA_RPC_URL'] ||
     '',
-  privateKeyBase58:
-    process.env['SOLANA_PRIVATE_KEY_BASE58'] ||
-    process.env['SOLANA_PRIVATE_KEY_BASE58Y_BASE58'] ||
-    process.env['SOLANA_ARB_SECRET_KEY'] ||
-    process.env['SOLANA_TREASURY_SECRET_KEY'] ||
-    '',
+  // Trading identity is explicit. Treasury and legacy aliases are never read.
+  privateKeyBase58: (process.env['SOLANA_PRIVATE_KEY_BASE58'] ?? '').trim(),
   jupiterBaseUrl: process.env['JUPITER_BASE_URL'] || 'https://lite-api.jup.ag/swap/v1',
   riskPolicy: {
     denyTiers: (process.env['SOLANA_RISK_DENY_TIERS'] ?? 'critical').split(',').map(s => s.trim()).filter(Boolean) as RiskTier[],

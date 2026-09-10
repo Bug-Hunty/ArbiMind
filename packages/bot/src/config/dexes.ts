@@ -198,12 +198,16 @@ const DEFAULT_DEX_CONFIG: Record<string, DexConfig> = {
   }
 };
 
-/** Validate all non-empty DEX addresses are valid EIP-55 checksummed. */
+/** Validate addresses only for venues that can actually be used. */
 function validateDexAddresses(dexConfig: Record<string, DexConfig>, label: string): Record<string, DexConfig> {
   const normalized: Record<string, DexConfig> = {};
 
   for (const [name, dex] of Object.entries(dexConfig)) {
     const nextDex: DexConfig = { ...dex };
+    if (!dex.enabled) {
+      normalized[name] = nextDex;
+      continue;
+    }
     for (const field of ['router', 'factory', 'quoter'] as const) {
       const addr = dex[field];
       if (!addr) continue;
@@ -223,6 +227,7 @@ function validateDexAddresses(dexConfig: Record<string, DexConfig>, label: strin
 }
 
 function resolveDexConfig(): Record<string, DexConfig> {
+  if (['false', '0', 'no', 'off'].includes(normalizeEnvValue(process.env['EVM_SCANNER_ENABLED']).toLowerCase())) return {};
   if (isArbitrumProfile()) return validateDexAddresses(buildArbitrumDexConfig(), 'Arbitrum');
   if (isEthereumSepoliaProfile()) return validateDexAddresses(buildSepoliaDexConfig(), 'Sepolia');
   return validateDexAddresses(DEFAULT_DEX_CONFIG, 'Ethereum');

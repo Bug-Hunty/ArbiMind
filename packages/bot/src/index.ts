@@ -8,6 +8,7 @@ try {
 } catch (error) {
   const message = error instanceof Error ? error.stack || error.message : String(error);
   console.error(`env bootstrap failed: ${message}`);
+  process.exit(1);
 }
 
 function isValidPrivateKey(value: string): boolean {
@@ -36,15 +37,6 @@ function isEnvFalse(value: string | undefined): boolean {
   return normalized === 'false' || normalized === '0' || normalized === 'no' || normalized === 'off';
 }
 
-function shouldGracefulExitFromEnv(): boolean {
-  if (isEnvTrue(process.env['LOG_ONLY']) || isEnvTrue(process.env['BOT_LOG_ONLY'])) {
-    return true;
-  }
-  const isTestnet = normalizeEnvValue(process.env['NETWORK'] || 'mainnet').toLowerCase() === 'testnet';
-  const allowTestnetTrades = isEnvTrue(process.env['ALLOW_TESTNET_TRADES']);
-  return isTestnet && !allowTestnetTrades;
-}
-
 function waitForShutdownSignal(): Promise<void> {
   return new Promise<void>((resolve) => {
     const onSignal = () => {
@@ -59,13 +51,16 @@ function waitForShutdownSignal(): Promise<void> {
 
 async function main(): Promise<void> {
   try {
-    console.error('[BOOT] importing ethers');
-    const { ethers } = await import('ethers');
-    console.error('[BOOT] imported ethers');
+    const evmScannerEnabled = !isEnvFalse(process.env['EVM_SCANNER_ENABLED']);
 
     console.error('[BOOT] importing config/index');
     const configModule = await import('./config/index.js');
     console.error('[BOOT] imported config/index');
+
+    // Reject invalid startup configuration before loading scanner dependencies.
+    const { refreshConfig, validateConfig, config } = configModule;
+    refreshConfig();
+    validateConfig();
 
     console.error('[BOOT] importing config/identity');
     const identityModule = await import('./config/identity.js');
@@ -74,10 +69,6 @@ async function main(): Promise<void> {
     console.error('[BOOT] importing utils/Logger');
     const loggerModule = await import('./utils/Logger.js');
     console.error('[BOOT] imported utils/Logger');
-
-    console.error('[BOOT] importing services/ArbitrageBot');
-    const botModule = await import('./services/ArbitrageBot.js');
-    console.error('[BOOT] imported services/ArbitrageBot');
 
     console.error('[BOOT] importing solana/Scanner');
     const solanaModule = await import('./solana/Scanner.js');
@@ -91,53 +82,54 @@ async function main(): Promise<void> {
     const solanaRpcGuardModule = await import('./solana/solanaRpcGuard.js');
     console.error('[BOOT] imported solana/solanaRpcGuard');
 
-    const { refreshConfig, validateConfig, config } = configModule;
     const { getIdentitySource, shortAddress } = identityModule;
     const { Logger } = loggerModule;
-    const { ArbitrageBot } = botModule;
     const { SolanaScanner } = solanaModule;
     const { solanaExecutorConfig } = solanaConfigModule;
     const { checkSolanaRpcHealth } = solanaRpcGuardModule;
+    const { validateExecutionSigner } = await import('./solana/signingIdentity.js');
+
+    // Missing or invalid execution credentials are fatal before an RPC fallback
+    // can downgrade the configuration and hide the identity error.
+    validateExecutionSigner(solanaExecutorConfig);
 
     const logger = new Logger('Main');
 
-    // Refresh config with loaded env vars
-    refreshConfig();
-    
     logger.info('🚀 Starting ArbiMind Arbitrage Bot...');
-    
-    // Validate configuration
-    validateConfig();
     logger.info('✅ Configuration validated');
 
     // Log selected chain
-    logger.info(`📡 Selected chain: ${config.evmChain} (chainId=${config.evmChainId})`);
-    logger.info(`🌐 RPC: ${config.ethereumRpcUrl.split('/').slice(0, 3).join('/')}/...`);
+    if (evmScannerEnabled) {
+      logger.info(`📡 Selected chain: ${config.evmChain} (chainId=${config.evmChainId})`);
+      logger.info(`🌐 RPC: ${config.ethereumRpcUrl.split('/').slice(0, 3).join('/')}/...`);
+    }
     if (config.logOnly) {
       logger.info('📊 Running in LOG_ONLY mode (no trades will be executed)');
     }
 
-    const evmScannerEnabled = !isEnvFalse(process.env['EVM_SCANNER_ENABLED']);
     if (!evmScannerEnabled) {
       logger.warn('⏸️ EVM scanner disabled by EVM_SCANNER_ENABLED=false; Solana scanner remains active');
     }
 
-    const privateKey = config.privateKey?.trim() || '';
-    const walletAddressEnv = config.walletAddress?.trim() || '';
-    const hasPrivateKey = isValidPrivateKey(privateKey);
-    const identitySource = getIdentitySource({
-      hasWallet: hasPrivateKey,
-      walletAddress: walletAddressEnv,
-    });
-    const effectiveAddress = hasPrivateKey
-      ? new ethers.Wallet(privateKey).address
-      : walletAddressEnv;
+    if (evmScannerEnabled) {
+      const { ethers } = await import('ethers');
+      const privateKey = config.privateKey?.trim() || '';
+      const walletAddressEnv = config.walletAddress?.trim() || '';
+      const hasPrivateKey = isValidPrivateKey(privateKey);
+      const identitySource = getIdentitySource({
+        hasWallet: hasPrivateKey,
+        walletAddress: walletAddressEnv,
+      });
+      const effectiveAddress = hasPrivateKey
+        ? new ethers.Wallet(privateKey).address
+        : walletAddressEnv;
 
-    logger.info(
-      `🔐 Identity: ${identitySource}${effectiveAddress ? ` (${shortAddress(effectiveAddress)})` : ''} | mode=${config.logOnly ? 'LOG_ONLY' : 'LIVE'}`
-    );
+      logger.info(
+        `🔐 Identity: ${identitySource}${effectiveAddress ? ` (${shortAddress(effectiveAddress)})` : ''} | mode=${config.logOnly ? 'LOG_ONLY' : 'LIVE'}`
+      );
+    }
 
-    if (config.canaryEnabled) {
+    if (evmScannerEnabled && config.canaryEnabled) {
       logger.warn('🧪 Running in CANARY mode', {
         canaryNotionalEth: config.canaryNotionalEth,
         canaryMaxDailyLossEth: config.canaryMaxDailyLossEth
@@ -166,8 +158,8 @@ async function main(): Promise<void> {
       evmChain: config.evmChain,
       chainId: config.evmChainId,
       evmScannerEnabled,
-      mode: config.logOnly ? 'LOG_ONLY' : 'LIVE',
-      canary: config.canaryEnabled,
+      mode: (evmScannerEnabled ? config.logOnly : solanaExecutorConfig.logOnly) ? 'LOG_ONLY' : 'LIVE',
+      canary: evmScannerEnabled && config.canaryEnabled,
       v3Enabled: !isEnvTrue(process.env['ENABLE_V3_QUOTES'] === 'false' ? 'false' : undefined),
       scanIntervalMs: config.scanIntervalMs,
       minProfitEth: config.minProfitEth,
@@ -188,7 +180,11 @@ async function main(): Promise<void> {
     }));
 
     // Create the arbitrage bot (EVM scanner can be disabled via env)
-    const bot = new ArbitrageBot();
+    let bot: import('./services/ArbitrageBot').ArbitrageBot | undefined;
+    if (evmScannerEnabled) {
+      const { ArbitrageBot } = await import('./services/ArbitrageBot.js');
+      bot = new ArbitrageBot();
+    }
     
     // Create and start the Solana scanner
     const solanaScanner = new SolanaScanner();
@@ -197,20 +193,20 @@ async function main(): Promise<void> {
     // Handle graceful shutdown
     process.on('SIGINT', () => {
       logger.info('🛑 Received SIGINT, shutting down gracefully...');
-      bot.stop();
+      bot?.stop();
       solanaScanner.stop();
       process.exit(0);
     });
 
     process.on('SIGTERM', () => {
       logger.info('🛑 Received SIGTERM, shutting down gracefully...');
-      bot.stop();
+      bot?.stop();
       solanaScanner.stop();
       process.exit(0);
     });
 
     // Start scanners based on runtime toggles
-    if (evmScannerEnabled) {
+    if (bot) {
       await bot.start();
     } else {
       logger.info('EVM scanner start skipped (EVM_SCANNER_ENABLED=false); process kept alive by Solana scanner loop');
@@ -218,14 +214,8 @@ async function main(): Promise<void> {
     }
 
   } catch (error) {
-    const shouldGracefulExit = shouldGracefulExitFromEnv();
     const message = error instanceof Error ? error.stack || error.message : String(error);
     console.error(`[FATAL] bot startup error @ ${new Date().toISOString()} error=${message}`);
-
-    if (shouldGracefulExit) {
-      console.warn('⚠️ Startup failed in LOG_ONLY mode. Exiting gracefully to avoid restart loop.');
-      process.exit(0);
-    }
 
     process.exit(1);
   }
