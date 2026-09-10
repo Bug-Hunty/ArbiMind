@@ -11,7 +11,7 @@
   },
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc",
+    "build": "node scripts/write-runtime-provenance.cjs && tsc",
     "dev": "tsx watch src/index.ts",
     "canary": "tsx src/canary.ts",
     "start": "npm run build && node dist/index.js",
