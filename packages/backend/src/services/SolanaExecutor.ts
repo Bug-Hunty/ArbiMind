@@ -6,7 +6,8 @@
  */
 
 import { Connection, Keypair, LAMPORTS_PER_SOL, VersionedTransaction } from '@solana/web3.js';
-import { parseTreasuryDiagnostics, getConnection } from '../routes/solanaTx';
+import { getConnection } from '../routes/solanaTx';
+import { readTradingSigner } from '../utils/solanaTradingSigner';
 import {
   type ArbitrageOpportunity,
   type LogEntry,
@@ -60,54 +61,27 @@ const MAX_HISTORY = 200;
 // ---------------------------------------------------------------------------
 
 /**
- * Initialize executor: resolve keypair from env vars.
- * Priority: SOLANA_TREASURY_SECRET_KEY → TREASURY_PRIVATE_KEY
- * Throws if neither is configured.
+ * Initialize only the explicit trading identity. Treasury keys are never read,
+ * aliased into another env variable, or consulted before initialization.
  */
 export function initializeExecutor(): void {
   if (resolvedKeypair) return; // already initialized
 
-  const hasPrimary = !!process.env.SOLANA_TREASURY_SECRET_KEY?.trim();
-  const hasFallback = !!process.env.TREASURY_PRIVATE_KEY?.trim();
-
-  // Alias TREASURY_PRIVATE_KEY so parseTreasuryDiagnostics can parse it
-  if (!hasPrimary && hasFallback) {
-    process.env.SOLANA_TREASURY_SECRET_KEY = process.env.TREASURY_PRIVATE_KEY;
-  }
-
-  if (!hasPrimary && !hasFallback) {
-    throw new Error(
-      '[EXECUTOR] No keypair configured \u2014 set SOLANA_TREASURY_SECRET_KEY or TREASURY_PRIVATE_KEY'
-    );
-  }
-
-  const diag = parseTreasuryDiagnostics();
-  if (!diag.configured || !diag.keypair) {
-    throw new Error(
-      '[EXECUTOR] Keypair env var found but failed to parse \u2014 check key format'
-    );
-  }
-
-  resolvedKeypair = diag.keypair;
-  keypairSource = hasPrimary ? 'SOLANA_TREASURY_SECRET_KEY' : 'TREASURY_PRIVATE_KEY';
+  resolvedKeypair = readTradingSigner();
+  keypairSource = 'SOLANA_PRIVATE_KEY_BASE58';
   addLog('info', `[EXECUTOR] Keypair loaded from ${keypairSource}`);
 }
 
 function getKeypairOrThrow(): Keypair {
   if (resolvedKeypair) return resolvedKeypair;
-  // Fallback for pre-init calls
-  const diag = parseTreasuryDiagnostics();
-  if (diag.configured && diag.keypair) return diag.keypair;
-  throw new Error('[EXECUTOR] No keypair available \u2014 call initializeExecutor first');
+  initializeExecutor();
+  if (!resolvedKeypair) throw new Error('[EXECUTOR] Trading identity unavailable');
+  return resolvedKeypair;
 }
 
 function getKeypairAndAddress(): { keypair: Keypair; address: string } | null {
   if (resolvedKeypair) {
     return { keypair: resolvedKeypair, address: resolvedKeypair.publicKey.toBase58() };
-  }
-  const diag = parseTreasuryDiagnostics();
-  if (diag.configured && diag.keypair) {
-    return { keypair: diag.keypair, address: diag.keypair.publicKey.toBase58() };
   }
   return null;
 }
@@ -128,7 +102,7 @@ export async function validateBeforeExecute(
   // Check wallet balance
   const resolved = getKeypairAndAddress();
   if (!resolved) {
-    return { valid: false, reason: 'Treasury keypair not configured' };
+    return { valid: false, reason: 'Explicit trading signer not initialized' };
   }
 
   const conn = getConnection('devnet');
@@ -377,6 +351,7 @@ export function getBotMode(): BotMode {
 }
 
 export function setBotMode(mode: BotMode): void {
+  if (mode === 'live') initializeExecutor();
   botMode = mode;
 }
 

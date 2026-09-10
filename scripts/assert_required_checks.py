@@ -1,169 +1,152 @@
 #!/usr/bin/env python3
-"""Fail closed when an expected check-run is missing, stale, or unsuccessful.
+"""Require successful, executed Actions steps from the exact PR head.
 
-A workflow that fails to START produces no check-run at all. ``gh pr checks``
-and ``mergeStateStatus`` then report the pull request as clean, because they can
-only summarise checks that exist -- absence of signal is indistinguishable from
-success.
-
-That happened on #383, the pull request that *added* secret-scanning rules: the
-Secret Scan workflow had a startup failure (conclusion=failure, jobs=[]), no
-check-run was created, and the PR reported CLEAN. It was one command away from
-merging with its secret scanner never having executed.
-
-The same shape appeared in #377/#379, where post-deploy smoke passed against a
-backend that had never received the commit. Health was verified; deployment was
-not.
-
-Three assertions, in this order, because they fail differently:
-
-1. the check-run EXISTS for the head SHA -- catches "never ran"
-2. it belongs to THIS head SHA           -- catches "stale run on an older commit"
-3. its conclusion is success             -- catches "ran and failed"
-
-Existence is checked first because a conclusion assertion over a nonexistent run
-is vacuously satisfied, which is exactly how #383 read as green.
+Workflow path + job name identifies evidence. Check names alone are ambiguous:
+CI/test failed its audit on 6b7cfd2 while Bot Tests/test passed, and the old
+assertion incorrectly returned success. Skipped/neutral and stale attempts are
+not evidence. A workflow rerun must rerun all of its required jobs.
 """
-
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 
-# Conclusions that do not indicate a problem. `neutral` and `skipped` cover
-# aggregate checks (e.g. CodeQL) that legitimately do not run on every change.
-OK_CONCLUSIONS = {"success", "neutral", "skipped"}
 
-DEFAULT_REQUIRED = ["Gitleaks Scan", "test", "powershell-smoke-tests"]
+@dataclass(frozen=True)
+class Requirement:
+    workflow: str
+    job: str
+    steps: tuple[str, ...]
+
+    @property
+    def label(self) -> str:
+        return f"{self.workflow} / {self.job}"
 
 
-def fetch_check_runs(repo: str, sha: str) -> list[dict]:
-    """Check-runs attached to this exact SHA.
+REQUIRED = (
+    Requirement("ci.yml", "test", (
+        "Security audit (bot + backend surfaces)", "Audit gate self-test",
+        "Typecheck all workspaces", "Test (parallel)", "Run pnpm build",
+    )),
+    Requirement("ci.yml", "powershell-smoke-tests", ("Run Pester suite",)),
+    Requirement("secret-scan.yml", "Gitleaks Scan", (
+        "Reject tracked env files", "Verify custom rules detect project secrets", "Run Gitleaks",
+    )),
+    Requirement("bot-tests.yml", "test", ("Lint bot code", "Run bot tests")),
+    Requirement("bot-build-check.yml", "bot-build-check", ("Build bot", "Unit tests (identity)")),
+    Requirement("codeql-analysis.yml", "Analyze (javascript-typescript)", ("Perform CodeQL Analysis",)),
+    *(Requirement("codeql.yml", f"Analyze ({language})", ("Perform CodeQL Analysis",))
+      for language in ("actions", "javascript-typescript", "python")),
+)
 
-    Querying by SHA rather than by branch is what prevents a run on an earlier
-    commit from satisfying the assertion.
-    """
-    try:
-        out = subprocess.run(
-            ["gh", "api", f"repos/{repo}/commits/{sha}/check-runs", "--paginate"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-        print(f"WARNING: could not query check-runs: {exc}", file=sys.stderr)
-        return []
 
-    runs: list[dict] = []
-    # --paginate can emit several JSON documents back to back.
+def api_list(endpoint: str, key: str) -> list[dict]:
+    output = subprocess.run(["gh", "api", endpoint, "--paginate"],
+                            capture_output=True, text=True, check=True).stdout
     decoder = json.JSONDecoder()
-    idx = 0
-    while idx < len(out):
-        while idx < len(out) and out[idx].isspace():
-            idx += 1
-        if idx >= len(out):
-            break
-        obj, end = decoder.raw_decode(out, idx)
-        runs.extend(obj.get("check_runs", []))
-        idx = end
+    items = []
+    remaining = output.strip()
+    while remaining:
+        page, end = decoder.raw_decode(remaining)
+        if not isinstance(page, dict) or not isinstance(page.get(key), list):
+            raise ValueError("Malformed Actions evidence")
+        items.extend(page[key])
+        remaining = remaining[end:].lstrip()
+    return items
+
+
+def newest_workflow(runs: list[dict], workflow: str) -> dict | None:
+    matches = [run for run in runs if run.get("path") == f".github/workflows/{workflow}"
+               and run.get("event") == "pull_request"]
+    # IDs order newly scheduled runs. completed_at would prefer an old success
+    # over a newly queued run (whose completion timestamp is null).
+    return max(matches, key=lambda run: (int(run.get("id", 0)), int(run.get("run_attempt", 0))), default=None)
+
+
+def collect(repo: str, sha: str) -> list[dict]:
+    runs = api_list(f"repos/{repo}/actions/runs?head_sha={sha}&event=pull_request&per_page=100", "workflow_runs")
+    for workflow in {required.workflow for required in REQUIRED}:
+        run = newest_workflow(runs, workflow)
+        if run and run.get("head_sha") == sha and run.get("status") == "completed":
+            attempt = int(run.get("run_attempt", 0))
+            run["jobs"] = api_list(
+                f"repos/{repo}/actions/runs/{int(run['id'])}/attempts/{attempt}/jobs?per_page=100", "jobs")
     return runs
 
 
-def classify(runs: list[dict], name: str) -> str:
-    """MISSING | PENDING | <conclusion> for the newest run with this name."""
-    matches = [r for r in runs if r.get("name") == name]
-    if not matches:
+def classify(run: dict | None, required: Requirement, sha: str) -> str:
+    if run is None:
         return "MISSING"
-    newest = sorted(matches, key=lambda r: r.get("completed_at") or "")[-1]
-    if newest.get("status") != "completed":
+    if run.get("head_sha") != sha:
+        return "wrong workflow SHA"
+    if run.get("status") != "completed":
         return "PENDING"
-    return newest.get("conclusion") or "none"
+    if run.get("conclusion") != "success":
+        return f"workflow {run.get('conclusion') or 'incomplete'}"
+    jobs = [job for job in run.get("jobs", []) if job.get("name") == required.job]
+    if len(jobs) != 1:
+        return "missing or ambiguous job evidence"
+    job = jobs[0]
+    if job.get("head_sha") != sha or job.get("run_id") != run.get("id"):
+        return "wrong job SHA or workflow run"
+    if job.get("run_attempt") != run.get("run_attempt"):
+        return "stale job attempt; rerun all workflow jobs"
+    if job.get("status") != "completed" or job.get("conclusion") != "success":
+        return f"job {job.get('conclusion') or 'incomplete'}"
+    if not job.get("started_at") or not job.get("completed_at"):
+        return "job did not execute"
+    for name in required.steps:
+        steps = [step for step in job.get("steps", []) if step.get("name") == name]
+        if len(steps) != 1:
+            return f"missing or ambiguous step: {name}"
+        step = steps[0]
+        if (step.get("status") != "completed" or step.get("conclusion") != "success"
+                or not step.get("started_at") or not step.get("completed_at")):
+            return f"step did not succeed and execute: {name}"
+    return "success"
 
 
-def evaluate(runs: list[dict], required: list[str]) -> tuple[list, list, list]:
+def evaluate(runs: list[dict], sha: str, required=REQUIRED) -> tuple[list[str], list[str], list[str]]:
     missing, pending, failed = [], [], []
-    for name in required:
-        status = classify(runs, name)
+    for requirement in required:
+        status = classify(newest_workflow(runs, requirement.workflow), requirement, sha)
         if status == "MISSING":
-            missing.append(name)
+            missing.append(requirement.label)
         elif status == "PENDING":
-            pending.append(name)
-        elif status not in OK_CONCLUSIONS:
-            failed.append(f"{name} ({status})")
+            pending.append(requirement.label)
+        elif status != "success":
+            failed.append(f"{requirement.label}: {status}")
     return missing, pending, failed
-
-
-def report_failure(sha, missing, pending, failed, runs, timeout_minutes) -> None:
-    print("FAILED: required check-runs are missing, stale, or unsuccessful.")
-    print()
-    print(f"PR head SHA: {sha}")
-    if missing:
-        print()
-        print("Missing entirely (a workflow that fails to START produces NO")
-        print("check-run, which reads as green rather than red):")
-        for m in missing:
-            print(f"  - {m}")
-    if pending:
-        print()
-        print(f"Never concluded within {timeout_minutes}m:")
-        for p in pending:
-            print(f"  - {p}")
-    if failed:
-        print()
-        print("Concluded unsuccessfully:")
-        for f in failed:
-            print(f"  - {f}")
-    print()
-    print("Observed check-runs on this SHA:")
-    if not runs:
-        print("  (none)")
-    for line in sorted({f"  - {r.get('name')}: {r.get('status')}/{r.get('conclusion') or '-'}" for r in runs}):
-        print(line)
 
 
 def main() -> int:
     repo = os.environ.get("REPO") or os.environ.get("GITHUB_REPOSITORY", "")
     sha = os.environ.get("HEAD_SHA", "")
-    timeout_minutes = float(os.environ.get("TIMEOUT_MINUTES", "20"))
-    poll_seconds = float(os.environ.get("POLL_SECONDS", "20"))
-    required = [
-        line.strip()
-        for line in os.environ.get("REQUIRED_CHECKS", "\n".join(DEFAULT_REQUIRED)).splitlines()
-        if line.strip()
-    ]
-
-    if not repo or not sha:
-        print("ERROR: REPO and HEAD_SHA must be set.")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) or not re.fullmatch(r"[a-f0-9]{40}", sha):
+        print("ERROR: valid REPO and exact HEAD_SHA are required.")
         return 1
-
-    print(f"Asserting required check-runs on {repo}@{sha}")
-    print("Required:")
-    for r in required:
-        print(f"  - {r}")
-    print()
-
-    deadline = time.time() + timeout_minutes * 60
+    deadline = time.monotonic() + float(os.environ.get("TIMEOUT_MINUTES", "20")) * 60
+    poll_seconds = min(60, max(1, float(os.environ.get("POLL_SECONDS", "20"))))
+    print(f"Asserting executed Actions evidence on {repo}@{sha}", flush=True)
     while True:
-        runs = fetch_check_runs(repo, sha)
-        missing, pending, failed = evaluate(runs, required)
-
+        try:
+            runs = collect(repo, sha)
+            missing, pending, failed = evaluate(runs, sha)
+        except (subprocess.CalledProcessError, FileNotFoundError, ValueError, KeyError) as error:
+            print(f"FAILED: could not retrieve trustworthy Actions evidence ({type(error).__name__}).")
+            return 1
         if not missing and not pending and not failed:
-            print("OK: every required check-run exists on this head SHA and concluded successfully.")
+            print("OK: every required workflow, job and step executed successfully on this exact head.")
             return 0
-
-        # A definite failure need not wait for the timeout.
-        if failed:
-            report_failure(sha, missing, pending, failed, runs, timeout_minutes)
+        print(json.dumps({"missing": missing, "pending": pending, "failed": failed}), flush=True)
+        if failed or time.monotonic() >= deadline:
+            print("FAILED: required Actions evidence is incomplete or unsuccessful.")
             return 1
-
-        if time.time() >= deadline:
-            report_failure(sha, missing, pending, failed, runs, timeout_minutes)
-            return 1
-
-        print(f"waiting {poll_seconds:.0f}s - pending={pending or '[]'} missing={missing or '[]'}")
         time.sleep(poll_seconds)
 
 

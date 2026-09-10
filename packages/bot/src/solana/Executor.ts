@@ -5,7 +5,7 @@ import {
   TransactionExpiredBlockheightExceededError,
   VersionedTransaction,
 } from '@solana/web3.js';
-import bs58 from 'bs58';
+import { parseTradingSigner, validateExecutionSigner } from './signingIdentity';
 import { createHash } from 'crypto';
 import { Logger } from '../utils/Logger';
 import { getVenueRisk } from './venueRisk';
@@ -248,9 +248,7 @@ export class SolanaExecutor {
       riskDenyIncidentTypes: this.config.riskPolicy.denyIncidentTypes,
     });
 
-    if (this.config.tradingEnabled && !this.config.logOnly) {
-      this.getWallet();
-    }
+    validateExecutionSigner(this.config);
 
     // Shadow snapshot persistence is opt-in and observability-only. Absent the
     // env var nothing is written and behaviour is byte-for-byte unchanged.
@@ -1256,56 +1254,13 @@ export class SolanaExecutor {
     }
 
     try {
-      const decoded = bs58.decode(privateKeyBase58);
-      if (decoded.length === 64) {
-        const keypair = Keypair.fromSecretKey(decoded);
-        this.logSignerLoaded(keypair, 'base58-64');
-        return { keypair, format: 'base58-64' };
-      }
-
-      if (decoded.length === 32) {
-        const keypair = Keypair.fromSeed(decoded);
-        this.logSignerLoaded(keypair, 'base58-32');
-        return { keypair, format: 'base58-32' };
-      }
+      const signer = parseTradingSigner(privateKeyBase58);
+      this.logSignerLoaded(signer.keypair, signer.format);
+      return signer;
     } catch {
-      // Continue to alternative parsers below.
+      this.logger.warn('Invalid explicit Solana trading signer');
+      return null;
     }
-
-    try {
-      if (/^[0-9a-fA-F]{64}$/.test(privateKeyBase58)) {
-        const keypair = Keypair.fromSeed(Uint8Array.from(Buffer.from(privateKeyBase58, 'hex')));
-        this.logSignerLoaded(keypair, 'hex');
-        return { keypair, format: 'hex' };
-      }
-
-      if (privateKeyBase58.startsWith('[') && privateKeyBase58.endsWith(']')) {
-        const parsed = JSON.parse(privateKeyBase58) as number[];
-        if (Array.isArray(parsed) && parsed.every((v) => Number.isInteger(v) && v >= 0 && v <= 255)) {
-          const bytes = Uint8Array.from(parsed);
-          if (bytes.length === 64) {
-            const keypair = Keypair.fromSecretKey(bytes);
-            this.logSignerLoaded(keypair, 'json-array-64');
-            return { keypair, format: 'json-array-64' };
-          }
-
-          if (bytes.length === 32) {
-            const keypair = Keypair.fromSeed(bytes);
-            this.logSignerLoaded(keypair, 'json-array-32');
-            return { keypair, format: 'json-array-32' };
-          }
-        }
-      }
-    } catch (error) {
-      this.logger.warn('Failed to decode SOLANA_PRIVATE_KEY_BASE58', {
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-
-    this.logger.warn('Failed to decode SOLANA_PRIVATE_KEY_BASE58', {
-      error: 'unsupported key format (expected base58 secret/seed, 64-char hex seed, or JSON byte array)',
-    });
-    return null;
   }
 
   private logSignerLoaded(

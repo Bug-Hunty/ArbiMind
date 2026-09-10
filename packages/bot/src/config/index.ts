@@ -377,6 +377,9 @@ export function refreshConfig(): void {
 
 // Validation
 export function validateConfig(): void {
+  // This validator owns EVM configuration only. Solana validates its own
+  // execution identity and RPC independently in the startup path.
+  if (isEnvFalse(process.env['EVM_SCANNER_ENABLED'])) return;
   // Re-read environment variables at validation time (they're set by dotenv.config() at startup)
   const privateKey = process.env['PRIVATE_KEY']?.trim() || '';
   const walletAddress = process.env['WALLET_ADDRESS']?.trim() || '';

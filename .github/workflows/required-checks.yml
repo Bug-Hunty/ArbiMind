@@ -16,6 +16,7 @@ on:
   pull_request:
 
 permissions:
+  actions: read
   contents: read
   checks: read
   pull-requests: read
@@ -31,6 +32,9 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
+
+      - name: Required-check assertion self-test
+        run: python3 tests/test_assert_required_checks.py
 
       - name: Assert required check-runs on PR head SHA
         env:
