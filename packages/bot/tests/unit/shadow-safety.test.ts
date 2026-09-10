@@ -555,7 +555,7 @@ describe('shadow mode safety', () => {
      */
     it('lets a log-only run reach "ready for $1 canary" once enough evaluations accumulate', async () => {
       installFetchMock();
-      let now = Date.now() - 25 * 60 * 60 * 1000;
+      let now = Date.now() - 30 * 60 * 60 * 1000;
       const metrics = new SessionMetrics({
         clock: () => now,
         economicsJournalPath: `${process.env['TEMP'] ?? process.env['TMP'] ?? '.'}/arbimind-positive-${process.pid}.jsonl`,
@@ -570,7 +570,7 @@ describe('shadow mode safety', () => {
       });
 
       for (let i = 0; i < READINESS.minGateEvaluations + 5; i++) {
-        now += 3_600_000 * 0.12;
+        now += 3_600_000 * 0.14;
         await executor.execute(makeOpportunity());
       }
 
