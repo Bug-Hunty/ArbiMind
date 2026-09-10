@@ -1,6 +1,20 @@
 import { loadEnv } from './bootstrapEnv';
+import { assertRequiredNodeVersion } from './RuntimeVersionGuard';
 
 console.error(`[BOOT] ArbiMind bot process start pid=${process.pid} node=${process.version} ts=${new Date().toISOString()}`);
+
+try {
+  const runtime = assertRequiredNodeVersion();
+  console.error(
+    `[BOOT] runtime guard passed requiredNodeVersion=${runtime.requiredNodeVersion} ` +
+      `actualNodeVersion=${runtime.actualNodeVersion}`,
+  );
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`[FATAL] ${message}`);
+  process.exitCode = 1;
+  throw error;
+}
 
 try {
   loadEnv();
