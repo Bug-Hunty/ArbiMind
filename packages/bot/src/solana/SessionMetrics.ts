@@ -124,6 +124,7 @@ export interface ReadinessHealth {
   };
   poolResolution: { configured: number; resolved: number; unresolved: number };
   observationPersistence: { attempted: number; succeeded: number; failed: number };
+  /** Requested swap builds, including Jupiter simulation; every settled attempt has one terminal result. */
   simulation: { attempted: number; succeeded: number; failed: number };
   sourceSha: string | null;
   runtimeSha: string | null;
@@ -442,6 +443,7 @@ export class SessionMetrics {
 
   recordSwapBuildAttempted(): void {
     this.swapBuildsAttempted++;
+    this.readinessHealth.simulation.attempted++;
   }
 
   recordSwapBuildLatency(ms: number): void {
@@ -508,10 +510,12 @@ export class SessionMetrics {
 
   recordSwapBuilt(): void {
     this.swapsBuilt++;
+    this.readinessHealth.simulation.succeeded++;
   }
 
   recordSwapBuildFailed(): void {
     this.swapBuildFailed++;
+    this.readinessHealth.simulation.failed++;
   }
 
   recordSubmitted(): void {

@@ -249,6 +249,9 @@ export function deriveRecommendation(snapshot: ShadowSnapshot): ShadowRecommenda
     if (feeRate === null || feeRate > 0.05) blockers.push('fee estimation is unavailable or outside tolerance');
     if (health.poolResolution.configured <= 0 || health.poolResolution.unresolved > 0) blockers.push('configured pools are unresolved');
     if (health.observationPersistence.attempted <= 0 || health.observationPersistence.failed > 0) blockers.push('observation persistence is not healthy');
+    // A snapshot taken during a build (or with a lost terminal event) cannot
+    // establish health. The serialized "attempted" count means requested.
+    if (health.simulation.attempted <= 0 || health.simulation.attempted !== health.simulation.succeeded + health.simulation.failed) blockers.push('build/simulation attempts have missing terminal results');
     if (health.simulation.failed > 0) blockers.push('quote/build/simulation failures were recorded');
     if (health.sourceSha === null || health.runtimeSha === null || health.sourceSha !== health.runtimeSha) blockers.push('runtime/source SHA provenance is missing or mismatched');
     if (health.requiredSafetyConfiguration !== true) blockers.push('required safety configuration is missing or invalid');

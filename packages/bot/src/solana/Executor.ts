@@ -785,8 +785,6 @@ export class SolanaExecutor {
         connection,
         this.lastExecutionFeeBudget,
       );
-      this.sessionMetrics.recordSwapBuilt();
-      this.sessionMetrics.recordSwapBuildLatency(Date.now() - swapBuildStartedAtMs);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.sessionMetrics.recordSwapBuildFailed();
@@ -795,7 +793,10 @@ export class SolanaExecutor {
         success: false,
         error: `swap build failed: ${message}`,
       };
+    } finally {
+      this.sessionMetrics.recordSwapBuildLatency(Date.now() - swapBuildStartedAtMs);
     }
+    this.sessionMetrics.recordSwapBuilt();
 
     if (this.config.logOnly) {
       this.logger.info('LOG_ONLY: built Solana swap transaction', {
@@ -1140,7 +1141,10 @@ export class SolanaExecutor {
       simulationError?: unknown;
       lastValidBlockHeight?: number;
     };
-    if (!body.swapTransaction) {
+    if (body?.simulationError != null) {
+      throw new Error('Jupiter swap simulation failed');
+    }
+    if (typeof body?.swapTransaction !== 'string' || body.swapTransaction.trim().length === 0) {
       throw new Error('Jupiter swap response missing swapTransaction');
     }
 

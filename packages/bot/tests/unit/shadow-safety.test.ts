@@ -45,6 +45,13 @@ const { sendTransaction, confirmTransaction, getLatestBlockhash, signedTransacti
   }),
 );
 
+const journalFiles = vi.hoisted(() => ({ roots: new Set<string>(), files: new Map<string, Buffer>() }));
+vi.mock('fs', async () => {
+  const actual = await vi.importActual<typeof import('fs')>('fs');
+  const { journalFilesystem } = await import('../mocks/journal-filesystem');
+  return journalFilesystem(actual, journalFiles);
+});
+
 /**
  * Silence the winston logger for this file.
  *
@@ -86,12 +93,13 @@ vi.mock('@solana/web3.js', async () => {
   };
 });
 
-import { Keypair } from '@solana/web3.js';
+import { Keypair, VersionedTransaction } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { SolanaExecutor, classifyQuoteError } from '../../src/solana/Executor';
 import type { SolanaExecutorConfig, SwapOpportunity } from '../../src/solana/Executor';
 import { SessionMetrics } from '../../src/solana/SessionMetrics';
-import { deriveRecommendation, READINESS } from '../../src/solana/ShadowReport';
+import { calculateEconomicStatistics, deriveRecommendation, READINESS } from '../../src/solana/ShadowReport';
+import { EconomicsJournal } from '../../src/solana/EconomicsJournal';
 import { SolPriceResolver } from '../../src/solana/SolPriceResolver';
 import { publishPoolResolution, publishRuntimeProvenance, publishSafetyConfiguration } from '../../src/solana/ReadinessProducers';
 
@@ -175,8 +183,10 @@ function makeOpportunity(overrides: Partial<SwapOpportunity> = {}): SwapOpportun
 }
 
 /** Jupiter quote + swap responses, routed by URL. */
+type MockResponse = Pick<Response, 'ok' | 'status' | 'json'> & Partial<Pick<Response, 'text'>>;
+
 function installFetchMock(): ReturnType<typeof vi.fn> {
-  const fetchMock = vi.fn(async (input: unknown) => {
+  const fetchMock = vi.fn(async (input: unknown): Promise<MockResponse> => {
     const url = String(input);
     if (url.includes('/quote')) {
       return {
@@ -208,6 +218,56 @@ function installFetchMock(): ReturnType<typeof vi.fn> {
   return fetchMock;
 }
 
+const readinessDirectories: string[] = [];
+
+function readinessMetrics(clock?: () => number): { metrics: SessionMetrics; journalPath: string } {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'arbimind-readiness-'));
+  readinessDirectories.push(directory);
+  journalFiles.roots.add(directory);
+  const journalPath = path.join(directory, 'economics.jsonl');
+  return { metrics: new SessionMetrics({ clock, economicsJournalPath: journalPath }), journalPath };
+}
+
+/** Input events traverse the real executor, producers, journal and snapshot. */
+async function healthyReadinessFixture() {
+  const fetchMock = installFetchMock();
+  const end = Date.now();
+  const start = end - 30 * 3_600_000;
+  let now = start;
+  const { metrics, journalPath } = readinessMetrics(() => now);
+  metrics.setAiScoringMode('local');
+  publishRuntimeProvenance(metrics, {
+    sourceSha: 'test-sha', runtimeSha: 'test-sha', nodeVersion: process.version,
+    startedAtIso: new Date(start).toISOString(), buildAtIso: new Date(start).toISOString(),
+  });
+  publishSafetyConfiguration(metrics, true);
+  publishPoolResolution(metrics, { configured: 1, resolved: 1 });
+  const executor = new SolanaExecutor(makeConfig({ logOnly: true }), undefined, {
+    gateConfig: PERMISSIVE_GATE, sessionMetrics: metrics,
+  });
+  const count = READINESS.minGateEvaluations + 5;
+  for (let i = 0; i < count; i++) {
+    now = start + i * (end - start) / (count - 1);
+    expect((await executor.execute(makeOpportunity())).logOnly).toBe(true);
+  }
+  expect(deriveRecommendation(metrics.getShadowSnapshot()).verdict).toBe('ready for $1 canary');
+  return { metrics, executor, fetchMock, journalPath, count };
+}
+
+function replaceSwapResponse(fetchMock: ReturnType<typeof vi.fn>, response: () => Promise<MockResponse>): void {
+  const original = fetchMock.getMockImplementation()!;
+  fetchMock.mockImplementation((input: unknown) => String(input).includes('/swap') ? response() : original(input));
+}
+
+function expectBuildHealth(metrics: SessionMetrics, attempted: number, succeeded: number, failed: number): void {
+  const health = metrics.getShadowSnapshot().readinessHealth.simulation;
+  expect(health).toEqual({ attempted, succeeded, failed });
+  expect(health.attempted).toBe(health.succeeded + health.failed);
+  expect(signedTransaction.sign).not.toHaveBeenCalled();
+  expect(sendTransaction).not.toHaveBeenCalled();
+  expect(confirmTransaction).not.toHaveBeenCalled();
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 describe('shadow mode safety', () => {
@@ -220,6 +280,15 @@ describe('shadow mode safety', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
+    journalFiles.files.clear();
+    journalFiles.roots.clear();
+    for (const directory of readinessDirectories.splice(0)) {
+      const resolved = path.resolve(directory);
+      if (path.dirname(resolved) !== path.resolve(os.tmpdir()) || !path.basename(resolved).startsWith('arbimind-readiness-')) {
+        throw new Error('refusing to remove a directory outside the readiness fixture');
+      }
+      rmSync(resolved, { recursive: true, force: true });
+    }
   });
 
   describe('SOLANA_LOG_ONLY=true', () => {
@@ -550,51 +619,27 @@ describe('shadow mode safety', () => {
      * Proves the previously-dead "ready for $1 canary" branch is reachable from
      * a real log-only run, not merely from a hand-built snapshot.
      *
-     * Window length is the one readiness dimension a fast test cannot satisfy
-     * for real (it needs wall-clock hours), so it is the only field overridden
-     * on the snapshot the executor actually produced.
-     *
-     * The iteration count derives from READINESS.minGateEvaluations rather than
-     * a literal, so if #413 replaces that threshold this test tracks the change
-     * instead of silently asserting a stale number.
+     * An injected clock supplies the 30h window. Only journal storage is
+     * virtualized: the real journal performs every read/write/rename, and all
+     * health signals come from the production path. No snapshot fields change.
      */
     it('lets a log-only run reach "ready for $1 canary" once enough evaluations accumulate', async () => {
-      installFetchMock();
-      let now = Date.now() - 30 * 60 * 60 * 1000;
-      const metrics = new SessionMetrics({
-        clock: () => now,
-        economicsJournalPath: `${process.env['TEMP'] ?? process.env['TMP'] ?? '.'}/arbimind-positive-${process.pid}.jsonl`,
-      });
-      metrics.setAiScoringMode('local');
-      publishRuntimeProvenance(metrics, {
-        sourceSha: 'test-sha',
-        runtimeSha: 'test-sha',
-        nodeVersion: 'v22.23.2',
-        startedAtIso: new Date().toISOString(),
-        buildAtIso: new Date().toISOString(),
-      });
-      publishSafetyConfiguration(metrics, true);
-      publishPoolResolution(metrics, { configured: 1, resolved: 1 });
-      const executor = new SolanaExecutor(makeConfig({ logOnly: true }), undefined, {
-        gateConfig: PERMISSIVE_GATE,
-        sessionMetrics: metrics,
-      });
-
-      for (let i = 0; i < READINESS.minGateEvaluations + 5; i++) {
-        now += 3_600_000 * 0.14;
-        await executor.execute(makeOpportunity());
-      }
-
+      const { metrics, journalPath, count } = await healthyReadinessFixture();
       const snap = metrics.getShadowSnapshot();
       expect(snap.gateEvaluated).toBeGreaterThanOrEqual(READINESS.minGateEvaluations);
       expect(snap.avgNetEdgeUsd).not.toBeNull();
       expect(snap.avgNetEdgeUsd!).toBeGreaterThan(0);
       expect(snap.submitted).toBe(0);
 
-      const recommendation = deriveRecommendation({
-        ...snap,
-      });
+      expect(snap.sessionDurationSec).toBe(30 * 3600);
+      expectBuildHealth(metrics, count, count, 0);
+      expect(new EconomicsJournal(journalPath).readAll()).toHaveLength(count);
+      expect(snap.readinessHealth.observationPersistence).toEqual({ attempted: count, succeeded: count, failed: 0 });
+      const statistics = calculateEconomicStatistics(snap.economicObservations);
+      expect(statistics.lowerConfidenceBound!).toBeGreaterThanOrEqual(READINESS.minEconomicFloorUsd);
+      const recommendation = deriveRecommendation(snap);
       expect(recommendation.verdict).toBe('ready for $1 canary');
+      console.info('READINESS_FIXTURE_EVIDENCE', JSON.stringify({ runtime: process.version, hours: snap.sessionDurationSec / 3600, simulation: snap.readinessHealth.simulation, lcb: statistics.lowerConfidenceBound, verdict: recommendation.verdict }));
     });
   });
 
@@ -805,6 +850,63 @@ describe('shadow mode safety', () => {
       } finally {
         rmSync(directory, { recursive: true, force: true });
       }
+    });
+  });
+
+  describe('swap build failure and simulation health propagation (#413)', () => {
+    it('records Jupiter simulationError as a build failure and blocks readiness', async () => {
+      const { metrics, executor, fetchMock } = await healthyReadinessFixture();
+      replaceSwapResponse(fetchMock, async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ simulationError: 'InstructionError(0, Custom(6001))' }),
+      }));
+
+      const result = await executor.execute(makeOpportunity());
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Jupiter swap simulation failed');
+
+      const count = READINESS.minGateEvaluations + 5 + 1;
+      expectBuildHealth(metrics, count, count - 1, 1);
+      const recommendation = deriveRecommendation(metrics.getShadowSnapshot());
+      expect(recommendation.verdict).toBe('not ready');
+      expect(recommendation.reasons).toContain('quote/build/simulation failures were recorded');
+    });
+
+    it('records missing swapTransaction as a build failure and blocks readiness', async () => {
+      const { metrics, executor, fetchMock } = await healthyReadinessFixture();
+      replaceSwapResponse(fetchMock, async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ swapTransaction: '' }),
+      }));
+
+      const result = await executor.execute(makeOpportunity());
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('missing swapTransaction');
+
+      const count = READINESS.minGateEvaluations + 5 + 1;
+      expectBuildHealth(metrics, count, count - 1, 1);
+      const recommendation = deriveRecommendation(metrics.getShadowSnapshot());
+      expect(recommendation.verdict).toBe('not ready');
+      expect(recommendation.reasons).toContain('quote/build/simulation failures were recorded');
+    });
+
+    it('records builder network throw as a build failure and blocks readiness', async () => {
+      const { metrics, executor, fetchMock } = await healthyReadinessFixture();
+      replaceSwapResponse(fetchMock, async () => {
+        throw new Error('ECONNRESET while posting to Jupiter /swap');
+      });
+
+      const result = await executor.execute(makeOpportunity());
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('ECONNRESET');
+
+      const count = READINESS.minGateEvaluations + 5 + 1;
+      expectBuildHealth(metrics, count, count - 1, 1);
+      const recommendation = deriveRecommendation(metrics.getShadowSnapshot());
+      expect(recommendation.verdict).toBe('not ready');
+      expect(recommendation.reasons).toContain('quote/build/simulation failures were recorded');
     });
   });
 });
