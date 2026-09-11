@@ -647,7 +647,7 @@ export class SessionMetrics {
     Object.assign(this.readinessHealth.feeEstimation, details);
   }
 
-  recordPoolResolution(configured: number, resolved: number): void {
+  publishPoolResolution(configured: number, resolved: number): void {
     this.readinessHealth.poolResolution = {
       configured,
       resolved,
@@ -661,12 +661,12 @@ export class SessionMetrics {
     else this.readinessHealth.observationPersistence.failed++;
   }
 
-  setReadinessProvenance(sourceSha: string | null, runtimeSha: string | null): void {
+  publishReadinessProvenance(sourceSha: string | null, runtimeSha: string | null): void {
     this.readinessHealth.sourceSha = sourceSha;
     this.readinessHealth.runtimeSha = runtimeSha;
   }
 
-  setRequiredSafetyConfiguration(valid: boolean): void {
+  publishSafetyConfiguration(valid: boolean): void {
     this.readinessHealth.requiredSafetyConfiguration = valid;
   }
 

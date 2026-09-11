@@ -93,6 +93,7 @@ import type { SolanaExecutorConfig, SwapOpportunity } from '../../src/solana/Exe
 import { SessionMetrics } from '../../src/solana/SessionMetrics';
 import { deriveRecommendation, READINESS } from '../../src/solana/ShadowReport';
 import { SolPriceResolver } from '../../src/solana/SolPriceResolver';
+import { publishPoolResolution, publishRuntimeProvenance, publishSafetyConfiguration } from '../../src/solana/ReadinessProducers';
 
 // ── Fixtures ───────────────────────────────────────────────────────
 
@@ -565,9 +566,15 @@ describe('shadow mode safety', () => {
         economicsJournalPath: `${process.env['TEMP'] ?? process.env['TMP'] ?? '.'}/arbimind-positive-${process.pid}.jsonl`,
       });
       metrics.setAiScoringMode('local');
-      metrics.setReadinessProvenance('test-sha', 'test-sha');
-      metrics.setRequiredSafetyConfiguration(true);
-      metrics.recordPoolResolution(1, 1);
+      publishRuntimeProvenance(metrics, {
+        sourceSha: 'test-sha',
+        runtimeSha: 'test-sha',
+        nodeVersion: 'v22.23.2',
+        startedAtIso: new Date().toISOString(),
+        buildAtIso: new Date().toISOString(),
+      });
+      publishSafetyConfiguration(metrics, true);
+      publishPoolResolution(metrics, { configured: 1, resolved: 1 });
       const executor = new SolanaExecutor(makeConfig({ logOnly: true }), undefined, {
         gateConfig: PERMISSIVE_GATE,
         sessionMetrics: metrics,

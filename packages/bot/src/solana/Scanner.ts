@@ -17,6 +17,7 @@ import { NetEdgeAccumulator } from './NetEdgeAccumulator';
 import { resolveSpeedTierPolicy, type TierPolicy } from './SpeedTierPolicy';
 import { SessionMetrics } from './SessionMetrics';
 import { assertExecutionProvenance, readRuntimeProvenance } from './RuntimeProvenance';
+import { publishPoolResolution, publishRuntimeProvenance, publishSafetyConfiguration } from './ReadinessProducers';
 import { Connection, Keypair } from '@solana/web3.js';
 import bs58 from 'bs58';
 
@@ -161,11 +162,8 @@ export class SolanaScanner {
     this.sessionMetrics.setAiScoringMode(config.aiScoringMode);
     const provenance = readRuntimeProvenance();
     assertExecutionProvenance(provenance, solanaExecutorConfig.logOnly);
-    this.sessionMetrics.setReadinessProvenance(
-      provenance.sourceSha,
-      provenance.runtimeSha,
-    );
-    this.sessionMetrics.setRequiredSafetyConfiguration(solanaExecutorConfig.logOnly);
+    publishRuntimeProvenance(this.sessionMetrics, provenance);
+    publishSafetyConfiguration(this.sessionMetrics, solanaExecutorConfig.logOnly);
 
     this.executor = solanaExecutorConfig.tradingEnabled
       ? new SolanaExecutor(solanaExecutorConfig, feeEstimatorConfig, {
@@ -434,7 +432,10 @@ export class SolanaScanner {
       snapshots.push({ poolAddress, pairData });
     }
 
-    this.sessionMetrics.recordPoolResolution(solanaConfig.watchedPools.length, snapshots.length);
+    publishPoolResolution(this.sessionMetrics, {
+      configured: solanaConfig.watchedPools.length,
+      resolved: snapshots.length,
+    });
 
     if (!snapshots.length) return;
 
