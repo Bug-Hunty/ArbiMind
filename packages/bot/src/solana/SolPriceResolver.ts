@@ -71,4 +71,8 @@ export class SolPriceResolver {
   getCache(): SolPriceCacheEntry | null {
     return this.cached ? { ...this.cached } : null;
   }
+
+  seedCache(priceUsd: number, observedAtMs: number): void {
+    this.cached = { priceUsd, observedAtMs };
+  }
 }

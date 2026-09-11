@@ -24,6 +24,7 @@ function observation(passed: boolean, feeAvailable = true): JournalObservation {
     feeEstimateAvailable: feeAvailable,
     feeEstimateSource: feeAvailable ? 'current-quote' : 'unavailable',
     feeEstimateAgeMs: feeAvailable ? 0 : null,
+    estimatedFeeLamports: feeAvailable ? 15_000 : null,
     passed,
     rejectReason: passed ? null : 'net_below_floor',
     simulationAttempted: false,

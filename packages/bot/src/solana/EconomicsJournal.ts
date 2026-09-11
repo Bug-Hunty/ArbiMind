@@ -20,6 +20,7 @@ export interface JournalObservation {
   feeEstimateAvailable: boolean;
   feeEstimateSource: string | null;
   feeEstimateAgeMs: number | null;
+  estimatedFeeLamports: number | null;
   passed: boolean;
   rejectReason: string | null;
   simulationAttempted: boolean;

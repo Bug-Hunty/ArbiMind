@@ -71,6 +71,19 @@ export interface ExecutionGateConfig {
   minEdgeBps: number;
 }
 
+export interface ExecutionFeeBudget {
+  computeUnitLimit: number;
+  priorityFeeMicroLamports: number;
+  estimatedBaseFeeLamports: number;
+  estimatedPriorityFeeLamports: number;
+  estimatedTotalFeeLamports: number | null;
+  solPriceUsd: number | null;
+  feeEstimateAvailable: boolean;
+  feeEstimateSource: string;
+  feeEstimateAgeMs: number | null;
+  estimatedExecutionFeeUsd: number | null;
+}
+
 export interface SwapOpportunity {
   inputMint: string;
   outputMint: string;
@@ -183,6 +196,7 @@ export class SolanaExecutor {
   private readonly sessionMetrics: SessionMetrics;
   private readonly solPriceResolver: SolPriceResolver;
   private readonly shadowWriter: ShadowSnapshotWriter | null = null;
+  private lastExecutionFeeBudget: ExecutionFeeBudget | null = null;
 
   constructor(
     config: SolanaExecutorConfig,
@@ -193,6 +207,7 @@ export class SolanaExecutor {
       gateConfig?: Partial<ExecutionGateConfig>;
       tierPolicy?: TierPolicy;
       sessionMetrics?: SessionMetrics;
+      solPriceResolver?: SolPriceResolver;
     },
   ) {
     this.config = config;
@@ -200,7 +215,7 @@ export class SolanaExecutor {
     this.landingTracker = deps?.landingTracker ?? new LandingTracker();
     this.netEdgeAccumulator = deps?.netEdgeAccumulator ?? new NetEdgeAccumulator();
     this.sessionMetrics = deps?.sessionMetrics ?? new SessionMetrics();
-    this.solPriceResolver = new SolPriceResolver(this.config.solPriceUsd ?? null);
+    this.solPriceResolver = deps?.solPriceResolver ?? new SolPriceResolver(this.config.solPriceUsd ?? null);
 
     // Merge gate config: explicit overrides > tier defaults > compiled defaults
     const tierMinNet = deps?.tierPolicy?.minNetProfitUsd;
@@ -617,7 +632,14 @@ export class SolanaExecutor {
           );
           // Estimated total fee ≈ base fee (5000) + CU * microLamportsPerCU
           // Use the priority fee estimate as total fee proxy for gate purposes
-          const totalFeeLamports = feeEst.maxLamports + 5000;
+          const configuredPriorityFeeLamports = Math.ceil(
+            (this.config.priorityFeeMicroLamports * this.config.computeUnitLimit) / 1_000_000,
+          );
+          const estimatedPriorityFeeLamports = Math.max(
+            feeEst.maxLamports,
+            configuredPriorityFeeLamports,
+          );
+          const totalFeeLamports = estimatedPriorityFeeLamports + 5000;
           estimatedFeeLamports = totalFeeLamports;
           estimatedExecutionFeeUsd = (totalFeeLamports / 1e9) * solPriceUsd;
           feeEstimateSource = feeEst.source;
@@ -627,8 +649,20 @@ export class SolanaExecutor {
           estimatedExecutionFeeUsd = 0;
         }
       }
+      this.lastExecutionFeeBudget = {
+        computeUnitLimit: this.config.computeUnitLimit,
+        priorityFeeMicroLamports: this.config.priorityFeeMicroLamports,
+        estimatedBaseFeeLamports: 5000,
+        estimatedPriorityFeeLamports: estimatedFeeLamports === null ? 0 : Math.max(0, estimatedFeeLamports - 5000),
+        estimatedTotalFeeLamports: estimatedFeeLamports,
+        solPriceUsd: solPrice.priceUsd,
+        feeEstimateAvailable,
+        feeEstimateSource: solPrice.source,
+        feeEstimateAgeMs: solPrice.ageMs,
+        estimatedExecutionFeeUsd: feeEstimateAvailable ? estimatedExecutionFeeUsd : null,
+      };
       this.sessionMetrics.recordFeeEstimation(feeEstimateAvailable, {
-        source: feeEstimateSource ?? solPrice.source,
+        source: solPrice.source,
         ageMs: solPrice.ageMs,
         estimatedFeeLamports,
         estimatedExecutionFeeUsd: feeEstimateAvailable ? estimatedExecutionFeeUsd : null,
@@ -703,8 +737,9 @@ export class SolanaExecutor {
         edgeBps: Number.isFinite(edgeBps) ? edgeBps : null,
         quoteAgeMs: Date.now() - quoteRequestedAtMs,
         feeEstimateAvailable,
-        feeEstimateSource: feeEstimateSource ?? solPrice.source,
+        feeEstimateSource: solPrice.source,
         feeEstimateAgeMs: solPrice.ageMs,
+        estimatedFeeLamports,
         passed: gate.passed,
         rejectReason: gate.rejectReason,
         simulationAttempted: false,
@@ -744,7 +779,12 @@ export class SolanaExecutor {
     const swapBuildStartedAtMs = Date.now();
     this.sessionMetrics.recordSwapBuildAttempted();
     try {
-      transaction = await this.buildSwapTransaction(quoteResponse, wallet.publicKey.toBase58(), connection);
+      transaction = await this.buildSwapTransaction(
+        quoteResponse,
+        wallet.publicKey.toBase58(),
+        connection,
+        this.lastExecutionFeeBudget,
+      );
       this.sessionMetrics.recordSwapBuilt();
       this.sessionMetrics.recordSwapBuildLatency(Date.now() - swapBuildStartedAtMs);
     } catch (error) {
@@ -1031,12 +1071,13 @@ export class SolanaExecutor {
     quoteResponse: JupiterQuoteResponse,
     userPublicKey: string,
     connection?: Connection,
+    feeBudget?: ExecutionFeeBudget | null,
   ): Promise<VersionedTransaction> {
     // Dynamic priority fee estimation (with landing-tracker escalation)
     let feeEstimate: PriorityFeeEstimate | null = null;
-    let maxLamports = this.config.priorityFeeMicroLamports;
+    let maxLamports = feeBudget?.estimatedPriorityFeeLamports ?? this.config.priorityFeeMicroLamports;
     let priorityLevel: string = 'medium';
-    if (connection) {
+    if (connection && !feeBudget) {
       try {
         feeEstimate = await this.feeEstimator.estimate(
           connection,
@@ -1057,7 +1098,8 @@ export class SolanaExecutor {
       quoteResponse,
       userPublicKey,
       wrapAndUnwrapSol: true,
-      dynamicComputeUnitLimit: true,
+      dynamicComputeUnitLimit: feeBudget ? false : true,
+      computeUnitLimit: feeBudget?.computeUnitLimit ?? this.config.computeUnitLimit,
       dynamicSlippage: true,
       prioritizationFeeLamports: maxLamports,
       asLegacyTransaction: this.config.asLegacyTransaction,

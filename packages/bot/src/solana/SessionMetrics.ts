@@ -585,6 +585,7 @@ export class SessionMetrics {
       feeEstimateAvailable: Number.isFinite(executionFeeUsd),
       feeEstimateSource: null,
       feeEstimateAgeMs: null,
+      estimatedFeeLamports: null,
       passed,
       rejectReason: passed ? null : 'unknown',
       simulationAttempted: false,

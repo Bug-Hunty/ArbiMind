@@ -11,6 +11,9 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'fs';
+import os from 'os';
+import path from 'path';
 
 // ── Solana web3 stub ───────────────────────────────────────────────
 // Connection and VersionedTransaction are replaced; Keypair/PublicKey stay
@@ -89,6 +92,7 @@ import { SolanaExecutor, classifyQuoteError } from '../../src/solana/Executor';
 import type { SolanaExecutorConfig, SwapOpportunity } from '../../src/solana/Executor';
 import { SessionMetrics } from '../../src/solana/SessionMetrics';
 import { deriveRecommendation, READINESS } from '../../src/solana/ShadowReport';
+import { SolPriceResolver } from '../../src/solana/SolPriceResolver';
 
 // ── Fixtures ───────────────────────────────────────────────────────
 
@@ -636,6 +640,164 @@ describe('shadow mode safety', () => {
       expect(snap.rpc.rateLimited).toBe(1);
       expect(snap.swapBuildsAttempted).toBe(0);
       expect(sendTransaction).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('production fee budget gate/builder equivalence (#412)', () => {
+    it.each([
+      ['current-quote', () => ({ opportunity: makeOpportunity(), resolver: new SolPriceResolver() })],
+      ['fresh-cache', () => {
+        const resolver = new SolPriceResolver();
+        resolver.seedCache(305, Date.now());
+        return { opportunity: makeOpportunity({ inputMint: USDC_MINT, outputMint: USDC_MINT }), resolver };
+      }],
+      ['configured-fallback', () => ({
+        opportunity: makeOpportunity({ inputMint: USDC_MINT, outputMint: USDC_MINT }),
+        resolver: new SolPriceResolver(305),
+      })],
+    ])('uses the production executor fee path for %s price', async (source, makeCase) => {
+      installFetchMock();
+      const { opportunity, resolver } = makeCase();
+      const metrics = new SessionMetrics();
+      const executor = new SolanaExecutor(makeConfig({ logOnly: true }), undefined, {
+        gateConfig: PERMISSIVE_GATE,
+        sessionMetrics: metrics,
+        solPriceResolver: resolver,
+      });
+
+      const result = await executor.execute(opportunity);
+      expect(result.success).toBe(true);
+      const row = metrics.getShadowSnapshot().economicObservations.at(-1)?.journal;
+      expect(row?.feeEstimateAvailable).toBe(true);
+      expect(row?.feeEstimateSource).toBe(source);
+      expect(row?.estimatedFeeLamports).toBeGreaterThan(0);
+      expect(row?.estimatedExecutionFeeUsd).toBeGreaterThan(0);
+    });
+
+    it.each([
+      ['stale-cache', () => {
+        const resolver = new SolPriceResolver();
+        resolver.seedCache(305, Date.now() - 120_000);
+        return resolver;
+      }],
+      ['unavailable', () => new SolPriceResolver()],
+    ])('blocks the production gate for %s price', async (_source, createResolver) => {
+      installFetchMock();
+      const metrics = new SessionMetrics();
+      const executor = new SolanaExecutor(makeConfig({ logOnly: true }), undefined, {
+        gateConfig: PERMISSIVE_GATE,
+        sessionMetrics: metrics,
+        solPriceResolver: createResolver(),
+      });
+
+      const result = await executor.execute(makeOpportunity({ inputMint: USDC_MINT, outputMint: USDC_MINT }));
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain('fee_estimate_unavailable');
+      const row = metrics.getShadowSnapshot().economicObservations.at(-1)?.journal;
+      expect(row?.feeEstimateAvailable).toBe(false);
+      expect(row?.passed).toBe(false);
+      expect(row?.estimatedExecutionFeeUsd).toBeNull();
+    });
+
+    it('propagates a configured priority-fee spike into gate economics and the builder', async () => {
+      const builderFees: number[] = [];
+      const fetchMock = vi.fn(async (input: unknown, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes('/quote')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              outAmount: '3050000',
+              inAmount: '10000000',
+              outputMint: USDC_MINT,
+              priceImpactPct: '0.01',
+              routePlan: [{ percent: 100, swapInfo: { ammKey: 'pool-a', label: 'Whirlpool' } }],
+            }),
+          };
+        }
+        if (url.includes('/swap')) {
+          builderFees.push(Number((JSON.parse(String(init?.body)) as Record<string, unknown>).prioritizationFeeLamports));
+          return { ok: true, status: 200, json: async () => ({ swapTransaction: Buffer.from('fake-tx').toString('base64') }) };
+        }
+        return { ok: false, status: 404, json: async () => ({}) };
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const normalMetrics = new SessionMetrics();
+      const spikeMetrics = new SessionMetrics();
+      await new SolanaExecutor(makeConfig({ logOnly: true, priorityFeeMicroLamports: 1_000 }), undefined, {
+        gateConfig: PERMISSIVE_GATE,
+        sessionMetrics: normalMetrics,
+      }).execute(makeOpportunity());
+      await new SolanaExecutor(makeConfig({ logOnly: true, priorityFeeMicroLamports: 100_000 }), undefined, {
+        gateConfig: PERMISSIVE_GATE,
+        sessionMetrics: spikeMetrics,
+      }).execute(makeOpportunity());
+
+      const normal = normalMetrics.getShadowSnapshot().economicObservations.at(-1)?.journal;
+      const spike = spikeMetrics.getShadowSnapshot().economicObservations.at(-1)?.journal;
+      expect(spike?.estimatedFeeLamports).toBeGreaterThan(normal?.estimatedFeeLamports ?? 0);
+      expect(spike?.estimatedExecutionFeeUsd).toBeGreaterThan(normal?.estimatedExecutionFeeUsd ?? 0);
+      expect(builderFees[1]).toBeGreaterThan(builderFees[0]);
+    });
+
+    it('passes one fee budget from the gate to the real swap builder', async () => {
+      let swapBody: Record<string, unknown> | null = null;
+      const fetchMock = vi.fn(async (input: unknown, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes('/quote')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              outAmount: '3050000',
+              inAmount: '10000000',
+              outputMint: USDC_MINT,
+              priceImpactPct: '0.01',
+              routePlan: [{ percent: 100, swapInfo: { ammKey: 'pool-a', label: 'Whirlpool' } }],
+            }),
+          };
+        }
+        if (url.includes('/swap')) {
+          swapBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ swapTransaction: Buffer.from('fake-tx').toString('base64') }),
+          };
+        }
+        return { ok: false, status: 404, json: async () => ({}) };
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const directory = mkdtempSync(path.join(os.tmpdir(), 'arbimind-fee-budget-'));
+      try {
+        const metrics = new SessionMetrics({ economicsJournalPath: path.join(directory, 'economics.jsonl') });
+        const executor = new SolanaExecutor(makeConfig({ computeUnitLimit: 200_000, priorityFeeMicroLamports: 1_000, logOnly: true }), undefined, {
+          gateConfig: PERMISSIVE_GATE,
+          sessionMetrics: metrics,
+        });
+
+        const result = await executor.execute(makeOpportunity());
+        expect(result.success).toBe(true);
+        expect(swapBody).not.toBeNull();
+        expect(swapBody?.['computeUnitLimit']).toBe(200_000);
+        expect(swapBody?.['prioritizationFeeLamports']).toBe(10_000);
+
+        const row = metrics.getShadowSnapshot().economicObservations.at(-1)?.journal;
+        expect(row?.feeEstimateAvailable).toBe(true);
+        expect(row?.estimatedExecutionFeeUsd).toBeGreaterThan(0);
+        expect(row?.estimatedExecutionFeeUsd).toBeCloseTo((15_000 / 1e9) * 305, 8);
+        expect(row?.estimatedExecutionFeeUsd).toBeGreaterThan(0);
+        expect(row?.estimatedExecutionFeeUsd).not.toBe(0);
+        // The builder's priority fee is the same estimated priority component
+        // recorded by the gate budget; changing either side must fail this test.
+        expect(swapBody?.['prioritizationFeeLamports']).toBe(
+          row!.estimatedFeeLamports! - 5_000,
+        );
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
     });
   });
 });
