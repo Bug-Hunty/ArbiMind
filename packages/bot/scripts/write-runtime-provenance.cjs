@@ -3,11 +3,9 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 
 const root = path.resolve(__dirname, '..', '..', '..');
-let sourceSha = null;
-try {
-  sourceSha = execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
-} catch {
-  sourceSha = process.env.ARBIMIND_SOURCE_SHA ?? null;
+const sourceSha = execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+if (!/^[a-f0-9]{40}$/.test(sourceSha)) {
+  throw new Error('Cannot generate runtime provenance: git HEAD is not a valid commit SHA');
 }
 
 const output = path.resolve(__dirname, '..', 'dist', 'runtime-provenance.json');

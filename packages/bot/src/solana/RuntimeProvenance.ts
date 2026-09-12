@@ -9,35 +9,54 @@ export interface RuntimeProvenance {
   buildAtIso: string | null;
 }
 
-export function readRuntimeProvenance(env: NodeJS.ProcessEnv = process.env): RuntimeProvenance {
-  let built: { sourceSha?: string | null; buildAtIso?: string | null } = {};
+function isCommitSha(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
+}
+
+function loadBuildArtifact(): unknown {
+  return JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'runtime-provenance.json'), 'utf8'));
+}
+
+export function readRuntimeProvenance(
+  env: NodeJS.ProcessEnv = process.env,
+  loadArtifact: () => unknown = loadBuildArtifact,
+): RuntimeProvenance {
+  let built: Record<string, unknown> = {};
   try {
-    built = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'runtime-provenance.json'), 'utf8')) as typeof built;
+    const artifact = loadArtifact();
+    if (artifact !== null && typeof artifact === 'object' && !Array.isArray(artifact)) {
+      built = artifact as Record<string, unknown>;
+    }
   } catch {
-    // Source-only/dev execution may not have a generated build artifact.
+    // Missing, unreadable or invalid artifacts remain unhealthy; environment cannot repair them.
   }
+  const artifactSha = isCommitSha(built['sourceSha']) ? built['sourceSha'] : null;
+  const hintsMatch = ['ARBIMIND_SOURCE_SHA', 'ARBIMIND_RUNTIME_SHA', 'GIT_SHA'].every(
+    (key) => env[key] === undefined || env[key] === artifactSha,
+  );
   return {
-    sourceSha: env['ARBIMIND_SOURCE_SHA'] ?? env['GIT_SHA'] ?? built.sourceSha ?? null,
-    runtimeSha: env['ARBIMIND_RUNTIME_SHA'] ?? env['GIT_SHA'] ?? built.sourceSha ?? null,
+    sourceSha: artifactSha,
+    // A null runtime identity carries the failure into the existing readiness producer.
+    runtimeSha: hintsMatch ? artifactSha : null,
     nodeVersion: process.version,
     startedAtIso: new Date().toISOString(),
-    buildAtIso: env['ARBIMIND_BUILD_AT'] ?? built.buildAtIso ?? null,
+    buildAtIso: typeof built['buildAtIso'] === 'string' ? built['buildAtIso'] : null,
   };
 }
 
 export function provenanceMatches(provenance: RuntimeProvenance): boolean {
   return Boolean(
-    provenance.sourceSha &&
-    provenance.runtimeSha &&
+    isCommitSha(provenance.sourceSha) &&
     provenance.sourceSha === provenance.runtimeSha,
   );
 }
 
 export function assertExecutionProvenance(
   provenance: RuntimeProvenance,
-  logOnly: boolean,
+  _logOnly: boolean,
 ): void {
-  if (!logOnly && !provenanceMatches(provenance)) {
-    throw new Error('[SOLANA] execution requires matching source/runtime provenance');
+  // LOG_ONLY also requires authoritative provenance so Baseline evidence is attributable.
+  if (!provenanceMatches(provenance)) {
+    throw new Error('[PROVENANCE] valid build artifact and matching environment SHA hints required; refusing to start');
   }
 }

@@ -1,5 +1,6 @@
 import { loadEnv } from './bootstrapEnv';
 import { assertRequiredNodeVersion } from './RuntimeVersionGuard';
+import { assertExecutionProvenance, readRuntimeProvenance } from './solana/RuntimeProvenance';
 
 console.error(`[BOOT] ArbiMind bot process start pid=${process.pid} node=${process.version} ts=${new Date().toISOString()}`);
 
@@ -22,6 +23,21 @@ try {
 } catch (error) {
   const message = error instanceof Error ? error.stack || error.message : String(error);
   console.error(`env bootstrap failed: ${message}`);
+}
+
+// Check before services start and outside the LOG_ONLY graceful-error handler.
+try {
+  const provenance = readRuntimeProvenance();
+  assertExecutionProvenance(provenance, false);
+  console.error(
+    `[BOOT] provenance PASS sourceSha=${provenance.sourceSha} runtimeSha=${provenance.runtimeSha} ` +
+      `node=${provenance.nodeVersion}`,
+  );
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`[FATAL] ${message}`);
+  process.exitCode = 1;
+  throw error;
 }
 
 function isValidPrivateKey(value: string): boolean {
