@@ -223,17 +223,17 @@ async function main(): Promise<void> {
     solanaScanner?.start();
     
     // Handle graceful shutdown
-    process.on('SIGINT', () => {
+    process.on('SIGINT', async () => {
       logger.info('🛑 Received SIGINT, shutting down gracefully...');
       bot?.stop();
-      solanaScanner?.stop();
+      await solanaScanner?.stop();
       process.exit(0);
     });
 
-    process.on('SIGTERM', () => {
+    process.on('SIGTERM', async () => {
       logger.info('🛑 Received SIGTERM, shutting down gracefully...');
       bot?.stop();
-      solanaScanner?.stop();
+      await solanaScanner?.stop();
       process.exit(0);
     });
 

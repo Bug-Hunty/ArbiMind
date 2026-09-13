@@ -183,6 +183,14 @@ function resetDailyLossIfNeeded(): void {
   }
 }
 
+/** Public-only identity for unsigned builds. No private key is generated or loaded. */
+function shadowBuildPublicKey(): PublicKey {
+  for (let nonce = 0; ; nonce++) {
+    const bytes = createHash('sha256').update(`arbimind:unsigned-shadow-build:${nonce}`).digest();
+    if (PublicKey.isOnCurve(bytes)) return new PublicKey(bytes);
+  }
+}
+
 export class SolanaExecutor {
   private readonly config: SolanaExecutorConfig;
   private readonly logger = new Logger('SolanaExecutor');
@@ -197,6 +205,8 @@ export class SolanaExecutor {
   private readonly solPriceResolver: SolPriceResolver;
   private readonly shadowWriter: ShadowSnapshotWriter | null = null;
   private lastExecutionFeeBudget: ExecutionFeeBudget | null = null;
+  private readonly liveExecutionEnabled: boolean;
+  private readonly shadowPublicKey: PublicKey | null;
 
   constructor(
     config: SolanaExecutorConfig,
@@ -210,7 +220,9 @@ export class SolanaExecutor {
       solPriceResolver?: SolPriceResolver;
     },
   ) {
-    this.config = config;
+    this.config = { ...config };
+    this.liveExecutionEnabled = this.config.tradingEnabled && !this.config.logOnly;
+    this.shadowPublicKey = this.config.logOnly ? shadowBuildPublicKey() : null;
     this.feeEstimator = new PriorityFeeEstimator(feeEstimatorConfig);
     this.landingTracker = deps?.landingTracker ?? new LandingTracker();
     this.netEdgeAccumulator = deps?.netEdgeAccumulator ?? new NetEdgeAccumulator();
@@ -268,7 +280,7 @@ export class SolanaExecutor {
       riskDenyIncidentTypes: this.config.riskPolicy.denyIncidentTypes,
     });
 
-    if (this.config.tradingEnabled && !this.config.logOnly) {
+    if (this.liveExecutionEnabled) {
       this.getWallet();
     }
 
@@ -385,7 +397,7 @@ export class SolanaExecutor {
   async execute(opportunity: SwapOpportunity): Promise<ExecutionResult> {
     resetDailyLossIfNeeded();
 
-    if (!this.config.tradingEnabled) {
+    if (!this.liveExecutionEnabled && !this.config.logOnly) {
       return this.skip('SOLANA_TRADING_ENABLED is false', opportunity);
     }
 
@@ -419,11 +431,13 @@ export class SolanaExecutor {
       return pnlGuard;
     }
 
-    const signer = this.getWallet();
-    if (!signer) {
+    const signer = this.liveExecutionEnabled ? this.getWallet() : null;
+    if (this.liveExecutionEnabled && !signer) {
       return this.skip('missing or invalid SOLANA_PRIVATE_KEY_BASE58', opportunity);
     }
-    const wallet = signer.keypair;
+    const wallet = signer?.keypair ?? null;
+    const publicKey = wallet?.publicKey ?? this.shadowPublicKey;
+    if (!publicKey) return this.skip('no evaluation identity available', opportunity);
 
     if (!this.config.rpcUrl) {
       return this.skip('missing SOLANA_RPC_URL', opportunity);
@@ -449,7 +463,7 @@ export class SolanaExecutor {
     }
 
     try {
-      return await this.executeInner(opportunity, wallet, maxNotionalUsd);
+      return await this.executeInner(opportunity, publicKey, wallet, maxNotionalUsd);
     } finally {
       if (this.inventoryManager) {
         this.inventoryManager.releaseLock();
@@ -459,7 +473,8 @@ export class SolanaExecutor {
 
   private async executeInner(
     opportunity: SwapOpportunity,
-    wallet: Keypair,
+    publicKey: PublicKey,
+    wallet: Keypair | null,
     maxNotionalUsd: number,
   ): Promise<ExecutionResult> {
     const connection = new Connection(this.config.rpcUrl, {
@@ -467,7 +482,7 @@ export class SolanaExecutor {
       confirmTransactionInitialTimeout: CONFIRM_TIMEOUT_MS,
     });
 
-    const sizedOpportunity = await this.applyPositionSizing(opportunity, connection, wallet.publicKey.toBase58());
+    const sizedOpportunity = await this.applyPositionSizing(opportunity, connection, publicKey.toBase58());
     if (!sizedOpportunity) {
       return this.skip('unable to calculate dynamic trade size', opportunity);
     }
@@ -781,7 +796,7 @@ export class SolanaExecutor {
     try {
       transaction = await this.buildSwapTransaction(
         quoteResponse,
-        wallet.publicKey.toBase58(),
+        publicKey.toBase58(),
         connection,
         this.lastExecutionFeeBudget,
       );
@@ -809,6 +824,10 @@ export class SolanaExecutor {
         priceImpactPct: quoteResponse.priceImpactPct,
       });
       return { success: true, logOnly: true };
+    }
+
+    if (!this.liveExecutionEnabled || !wallet) {
+      return this.skip('live execution authority disabled', opportunity);
     }
 
     this.logger.info('[SOLANA] swap attempt', {
@@ -1162,6 +1181,11 @@ export class SolanaExecutor {
     connection: Connection,
     ammMeta: AmmMeta
   ): Promise<ExecutionResult> {
+    // Reject even a direct call supplying a signer: building a shadow
+    // transaction never grants permission to sign, submit or confirm it.
+    if (!this.liveExecutionEnabled || !this.config.tradingEnabled || this.config.logOnly) {
+      return this.skip('live execution authority disabled', opportunity);
+    }
     const quoteAgeMs = opportunity.quotedAtMs ? Date.now() - opportunity.quotedAtMs : Number.NaN;
     if (Number.isFinite(quoteAgeMs) && quoteAgeMs > this.config.quoteMaxAgeMs) {
       return this.skip(
@@ -1370,6 +1394,7 @@ export class SolanaExecutor {
   }
 
   private getWallet(): SolanaSigner | null {
+    if (!this.liveExecutionEnabled) return null;
     const privateKeyBase58 = this.config.privateKeyBase58.trim();
     if (!privateKeyBase58) {
       return null;

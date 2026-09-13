@@ -105,6 +105,7 @@ export class SolanaScanner {
   private scanConnection: Connection | null = null;
   private scanWallet: Keypair | null = null;
   private isRunning = false;
+  private readonly liveExecutionEnabled: boolean;
 
   private clamp(value: number, min = 0, max = 1): number {
     return Math.min(max, Math.max(min, value));
@@ -165,7 +166,10 @@ export class SolanaScanner {
     publishRuntimeProvenance(this.sessionMetrics, provenance);
     publishSafetyConfiguration(this.sessionMetrics, solanaExecutorConfig.logOnly);
 
-    this.executor = solanaExecutorConfig.tradingEnabled
+    // Observation does not grant transaction authority.
+    const shadowEvaluationEnabled = solanaConfig.enabled && solanaExecutorConfig.logOnly;
+    this.liveExecutionEnabled = solanaExecutorConfig.tradingEnabled && !solanaExecutorConfig.logOnly;
+    this.executor = shadowEvaluationEnabled || this.liveExecutionEnabled
       ? new SolanaExecutor(solanaExecutorConfig, feeEstimatorConfig, {
           landingTracker,
           netEdgeAccumulator,
@@ -183,7 +187,7 @@ export class SolanaScanner {
       : null;
 
     // Set up inventory manager
-    if (this.executor && inventoryConfig.autoFundEnabled) {
+    if (this.liveExecutionEnabled && this.executor && inventoryConfig.autoFundEnabled) {
       this.inventoryManager = new SolanaInventoryManager({
         config: inventoryConfig,
         jupiterBaseUrl: solanaExecutorConfig.jupiterBaseUrl,
@@ -199,7 +203,7 @@ export class SolanaScanner {
     }
 
     // FundingManager — step 1: balance snapshot logging on each tick
-    if (inventoryConfig.autoFundEnabled && solanaExecutorConfig.rpcUrl) {
+    if (this.liveExecutionEnabled && inventoryConfig.autoFundEnabled && solanaExecutorConfig.rpcUrl) {
       this.fundingManager = new FundingManager({
         autoRebalanceEnabled: inventoryConfig.autoRebalanceEnabled,
         targetSolReserve: inventoryConfig.targetSolReserve,
@@ -241,8 +245,10 @@ export class SolanaScanner {
       solanaMinExecutionConfidence: SOLANA_MIN_EXECUTION_CONFIDENCE,
       effectiveThreshold: Math.max(config.aiMinSuccessProb, SOLANA_MIN_EXECUTION_CONFIDENCE),
     });
-    if (solanaExecutorConfig.tradingEnabled) {
-      logger.warn('🧪 Solana executor armed', {
+    if (this.executor) {
+      logger.info('[SOLANA] evaluation capabilities', {
+        shadowEvaluationEnabled: solanaExecutorConfig.logOnly,
+        liveExecutionEnabled: this.liveExecutionEnabled,
         logOnly: solanaExecutorConfig.logOnly,
         canaryMode: solanaExecutorConfig.canaryMode,
         maxNotionalUsd: solanaExecutorConfig.maxNotionalUsd,
@@ -335,7 +341,7 @@ export class SolanaScanner {
         event: 'funding_manager_init',
         ts: new Date().toISOString(),
         autoFundEnabled: false,
-        reason: 'SOLANA_AUTO_FUND_ENABLED not set or false',
+        reason: 'live execution or automatic funding disabled',
       }));
     }
 
@@ -346,7 +352,7 @@ export class SolanaScanner {
   /**
    * Stop the scanner
    */
-  stop(): void {
+  async stop(): Promise<void> {
     logger.info('🛑 Stopping Solana scanner');
     this.isRunning = false;
     this.sessionMetrics.stopPeriodicSummary();
@@ -355,12 +361,14 @@ export class SolanaScanner {
     if (this.inventoryManager) {
       this.inventoryManager.stopRebalanceLoop();
     }
+    await this.executor?.stopShadowSnapshots();
   }
 
   /**
    * Resolve wallet keypair from config (mirrors Executor.getWallet parsing).
    */
   private resolveWallet(): Keypair | null {
+    if (!this.liveExecutionEnabled) return null;
     const raw = solanaExecutorConfig.privateKeyBase58?.trim();
     if (!raw) return null;
     try {

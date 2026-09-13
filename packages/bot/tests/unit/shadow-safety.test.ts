@@ -356,9 +356,9 @@ describe('shadow mode safety', () => {
   });
 
   describe('pre-execution gates', () => {
-    it('SOLANA_TRADING_ENABLED=false skips before any quote, build or send', async () => {
+    it('trading disabled without LOG_ONLY skips before any quote, build or send', async () => {
       const fetchMock = installFetchMock();
-      const executor = new SolanaExecutor(makeConfig({ tradingEnabled: false }));
+      const executor = new SolanaExecutor(makeConfig({ tradingEnabled: false, logOnly: false }));
 
       const result = await executor.execute(makeOpportunity());
 

@@ -40,8 +40,13 @@ swap transaction is built. This is enforced by tests — see
 These are the recommended settings for a shadow run:
 
 ```bash
-SOLANA_TRADING_ENABLED=true
+SOLANA_SCANNER_ENABLED=true
+SOLANA_TRADING_ENABLED=false
 SOLANA_LOG_ONLY=true
+LOG_ONLY=true
+BOT_LOG_ONLY=true
+EVM_SCANNER_ENABLED=false
+EVM_TRADING_ENABLED=false
 SOLANA_CANARY_MODE=true
 SOLANA_MAX_NOTIONAL_USD=5
 SOLANA_MIN_NOTIONAL_USD=3
@@ -77,10 +82,41 @@ otherwise `disabled`. `local` must be opted into.
 > favourable. The report states this next to the counters so the numbers are not
 > misread as the model having driven the outcome.
 
-`SOLANA_TRADING_ENABLED=true` looks alarming next to `SOLANA_LOG_ONLY=true`,
-but both are required. `SOLANA_TRADING_ENABLED=false` short-circuits the whole
-pipeline before it ever requests a quote, so the run would produce no data at
-all. `SOLANA_LOG_ONLY=true` is the gate that prevents sending.
+### Observation and execution authority
+
+Trading disabled means no authority to execute. With the scanner enabled and
+`SOLANA_LOG_ONLY=true`, the same production executor still obtains quotes,
+estimates fees, evaluates economics, builds unsigned transactions, and writes
+the journal and snapshots. Fee arithmetic and readiness thresholds are shared
+with the live path.
+
+| Scanner | Trading | LOG_ONLY | Behavior |
+|---|---|---|---|
+| true | false | true | Shadow evaluation; no signer, funding, signing, sending, or confirmation |
+| true | false | false | Scanner only; no executor or economics evaluation |
+| true | true | true | Shadow evaluation; no live authority |
+| true | true | false | Live-capable path, still subject to explicit trading signer and canary/risk gates |
+| false | false | either | No production scanner or shadow evaluator |
+
+Dependencies have separate responsibilities:
+
+| Responsibility | Owner/components |
+|---|---|
+| Observation | Scanner-owned SessionMetrics and EconomicsJournal; executor-owned ShadowSnapshotWriter |
+| Shadow evaluation | SolanaExecutor, quote fetch, PriorityFeeEstimator, shared ExecutionFeeBudget, gate, unsigned swap builder |
+| Execution authority | Trading signer, funding/inventory managers, signAndSend and submission/confirmation RPC operations |
+
+Shadow builds use a public-only, on-curve address derived from a hash. They do
+not load or generate a private key, and that address must not be funded. A
+build or simulation failure remains a failure in the existing readiness
+counters; unsigned construction does not establish that a funded live wallet
+could execute the trade. Dynamic sizing retains its balance requirement and
+fails closed without a positive observed balance.
+
+The live boundary independently rejects calls unless trading is enabled and
+LOG_ONLY is false, before accessing the supplied signer or signing. Funding
+and inventory managers are also restricted to that live-capable mode. On
+shutdown the scanner stops its snapshot timer and awaits the final write.
 
 ### Shadow reporting settings
 
@@ -278,13 +314,19 @@ A run that fails to produce evidence is treated as failing, never as passing.
 ## Safety guarantees
 
 These are enforced by tests in
-[`packages/bot/tests/unit/shadow-safety.test.ts`](../../packages/bot/tests/unit/shadow-safety.test.ts):
+[`shadow-safety.test.ts`](../../packages/bot/tests/unit/shadow-safety.test.ts) and
+[`shadow-pipeline.test.ts`](../../packages/bot/tests/unit/shadow-pipeline.test.ts):
 
 - With `SOLANA_LOG_ONLY=true`, the executor builds the swap transaction and
   never calls `sendTransaction`, never calls `confirmTransaction`, and never
   signs.
-- `SOLANA_TRADING_ENABLED=false` skips before any network call.
-- A missing wallet key skips before any quote or send.
+- Trading disabled with LOG_ONLY enabled still journals scanner evaluations
+  and writes readable snapshots without a signer.
+- Trading disabled with LOG_ONLY disabled skips before any quote or send.
+- A missing trading signer blocks the live-capable path. Treasury and legacy
+  credentials cannot substitute for it.
+- Direct calls to the live submission boundary are rejected before signing
+  when either trading is disabled or LOG_ONLY is enabled.
 - Notional caps and the canary ceiling reject oversized opportunities before
   quoting.
 - The stale quote guard rejects aged quotes rather than sending them.
@@ -344,8 +386,9 @@ purpose: a missing run must not be mistaken for an empty one.
 **Report shows `0` for everything** — the bot was running but never reached the
 quote stage. Read the `AI scoring:` section first: if `returned` is 0 while
 `requested` is not, the scorer never answered and the funnel never started.
-Set `AI_SCORING_MODE=local`. Otherwise check `SOLANA_TRADING_ENABLED=true` and
-look at `top pre-gate skips`.
+Set `AI_SCORING_MODE=local`. Otherwise check `SOLANA_SCANNER_ENABLED=true`,
+`SOLANA_LOG_ONLY=true`, and `top pre-gate skips`. Trading remains disabled for
+a shadow run; do not enable it to obtain observations.
 
 **`🤖 No AI score` in the logs** — scoring is unconfigured or failing. The log
 line carries `outcome` and `reason`. `AI_SCORING_MODE=local` needs no external
