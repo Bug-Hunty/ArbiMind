@@ -17,7 +17,7 @@
     "docs:check": "pnpm exec tsx -e \"import('./src/app/docs/lib/docsContent.ts').then(()=>console.log('docs ok')).catch(e=>{console.error(e);process.exit(1)})\""
   },
   "dependencies": {
-    "@rainbow-me/rainbowkit": "^2.2.9",
+    "@rainbow-me/rainbowkit": "^2.2.11",
     "@solana/wallet-adapter-backpack": "^0.1.8",
     "@solana/wallet-adapter-base": "^0.9.27",
     "@solana/wallet-adapter-react": "^0.15.39",
