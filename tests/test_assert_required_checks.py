@@ -1,6 +1,9 @@
 """Dependency-free regression tests for the merge evidence gate."""
+import contextlib
 import copy
 import importlib.util
+import io
+import os
 from pathlib import Path
 import sys
 import unittest
@@ -27,6 +30,30 @@ def passing():
                             "run_id": run["id"], "run_attempt": 1,
                             "steps": [{**executed, "name": step} for step in requirement.steps]})
     return runs
+
+
+def run_main(collect, timeout_minutes="0", poll_seconds="0"):
+    """Drive main()'s poll loop over a stubbed evidence source."""
+    keys = ("REPO", "HEAD_SHA", "TIMEOUT_MINUTES", "POLL_SECONDS")
+    saved_env = {key: os.environ.get(key) for key in keys}
+    saved_collect, saved_sleep = gate.collect, gate.time.sleep
+    gate.collect = collect
+    gate.time.sleep = lambda _seconds: None
+    os.environ.update({"REPO": "Bug-Hunty/ArbiMind", "HEAD_SHA": SHA,
+                       "TIMEOUT_MINUTES": timeout_minutes, "POLL_SECONDS": poll_seconds})
+    buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buffer):
+            code = gate.main()
+    finally:
+        gate.collect, gate.time.sleep = saved_collect, saved_sleep
+        for key, value in saved_env.items():
+            os.environ.pop(key, None) if value is None else os.environ.__setitem__(key, value)
+    return code, buffer.getvalue()
+
+
+def workflow(runs, name):
+    return next(run for run in runs if run["path"].endswith("/" + name))
 
 
 class RequiredChecksTests(unittest.TestCase):
@@ -99,6 +126,64 @@ class RequiredChecksTests(unittest.TestCase):
         runs = passing()
         runs[0]["jobs"].append(copy.deepcopy(runs[0]["jobs"][0]))
         self.assertTrue(gate.evaluate(runs, SHA)[2])
+
+    def test_same_job_name_in_another_workflow_cannot_satisfy_failing_target(self):
+        """The 6b7cfd2 shape: two jobs named `test`, one green, one red."""
+        runs = passing()
+        ci, bot = workflow(runs, "ci.yml"), workflow(runs, "bot-tests.yml")
+        # Both really are called `test`; only the workflow tells them apart.
+        self.assertEqual(ci["jobs"][0]["name"], bot["jobs"][0]["name"], "test")
+        ci["jobs"][0]["conclusion"] = "failure"
+
+        failed = gate.evaluate(runs, SHA)[2]
+        self.assertTrue(any(f.startswith("ci.yml / test") for f in failed))
+        # ...and the green one is not dragged down with it.
+        self.assertFalse(any(f.startswith("bot-tests.yml / test") for f in failed))
+
+    def test_legacy_name_only_selection_is_what_produced_the_false_green(self):
+        """Root-cause witness: name + newest completed_at picks the wrong run."""
+        same_name = [
+            {"name": "test", "status": "completed", "conclusion": "failure",
+             "completed_at": "2026-09-09T20:00:00Z"},   # CI / test
+            {"name": "test", "status": "completed", "conclusion": "success",
+             "completed_at": "2026-09-09T20:05:00Z"},   # Bot Tests / test
+        ]
+        legacy = sorted(same_name, key=lambda r: r.get("completed_at") or "")[-1]
+        self.assertEqual(legacy["conclusion"], "success")  # the old gate's answer
+
+        # The replacement identifies evidence by workflow+job+steps, and a
+        # check-run display name is not part of that identity at all.
+        self.assertEqual(set(gate.Requirement.__dataclass_fields__), {"workflow", "job", "steps"})
+
+    def test_pending_target_fails_after_timeout(self):
+        runs = passing()
+        queued = workflow(runs, "ci.yml")
+        queued.update({"status": "queued", "conclusion": None, "jobs": []})
+
+        code, output = run_main(lambda _repo, _sha: runs, timeout_minutes="0")
+        self.assertEqual(code, 1)
+        self.assertIn("FAILED", output)
+
+    def test_pending_target_waits_rather_than_failing_immediately(self):
+        stalled = passing()
+        workflow(stalled, "ci.yml").update({"status": "queued", "conclusion": None, "jobs": []})
+        polls = [stalled, passing()]
+
+        code, output = run_main(lambda _repo, _sha: polls.pop(0), timeout_minutes="5")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(polls, [], "should have polled a second time instead of giving up")
+
+    def test_exact_sha_success_passes_through_main(self):
+        code, output = run_main(lambda _repo, _sha: passing(), timeout_minutes="5")
+        self.assertEqual(code, 0)
+        self.assertIn("executed successfully on this exact head", output)
+
+    def test_wrong_sha_fails_through_main(self):
+        runs = passing()
+        for run in runs:
+            run["head_sha"] = "b" * 40
+        code, _ = run_main(lambda _repo, _sha: runs, timeout_minutes="0")
+        self.assertEqual(code, 1)
 
 
 if __name__ == "__main__":
