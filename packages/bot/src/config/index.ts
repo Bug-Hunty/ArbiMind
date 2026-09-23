@@ -2,6 +2,7 @@ import { arbitrum, arbitrumSepolia, mainnet, polygon, polygonAmoy, sepolia } fro
 import { ALLOWLISTED_TOKENS, TOKEN_PAIRS } from './tokens';
 import { DEX_CONFIG, ENABLED_DEXES } from './dexes';
 import { Logger } from '../utils/Logger';
+import { readEvmSubsystemState } from './subsystems';
 
 // Note: dotenv.config() is called in src/index.ts BEFORE this module is imported
 
@@ -306,7 +307,7 @@ function createConfig(): BotConfig {
     network: isTestnet ? 'testnet' : 'mainnet',
     evmChain: evmChain === 'polygon' || evmChain === 'ethereum' ? (evmChain as 'polygon' | 'ethereum') : 'arbitrum',
     evmChainId: chainConfig.chainId,
-    evmTradingEnabled: !isEnvFalse(process.env['EVM_TRADING_ENABLED']),
+    evmTradingEnabled: readEvmSubsystemState().tradingEnabled,
     logOnly: forcedLogOnlyForSafety || explicitLogOnly || (isTestnet && !allowTestnetTrades),
     allowTestnetTrades,
     
@@ -377,6 +378,8 @@ export function refreshConfig(): void {
 
 // Validation
 export function validateConfig(): void {
+  // This validator owns EVM operational configuration. Solana keeps its own startup guards.
+  if (!readEvmSubsystemState().enabled) return;
   // Re-read environment variables at validation time (they're set by dotenv.config() at startup)
   const privateKey = process.env['PRIVATE_KEY']?.trim() || '';
   const walletAddress = process.env['WALLET_ADDRESS']?.trim() || '';

@@ -6,6 +6,7 @@
  */
 
 import { Logger } from '../utils/Logger';
+import { EconomicsJournal, type JournalObservation } from './EconomicsJournal';
 
 const logger = new Logger('SessionMetrics');
 
@@ -103,6 +104,111 @@ export interface AiScoringCounters {
   belowConfidence: number;
 }
 
+export interface EconomicObservation {
+  timestampMs: number;
+  netExpectedUsd: number | null;
+  usable: boolean;
+  passed: boolean;
+  journal: JournalObservation;
+}
+
+/**
+ * Two independent provenances feed one execution-fee estimate, and conflating
+ * them is what made degradation invisible: `source` below is the SOL/USD
+ * price's origin, never the priority-fee estimator's. Both are counted.
+ */
+export type FeeEstimationState =
+  /** attempted === 0. No estimate ever ran, so nothing is known -- not health. */
+  | 'NOT_EXERCISED'
+  /** Every attempt used live/current inputs on both axes. */
+  | 'HEALTHY'
+  /** Estimates were produced, but some leaned on a fallback input. */
+  | 'DEGRADED_FALLBACK'
+  /** At least one attempt could not produce an estimate at all. */
+  | 'UNAVAILABLE';
+
+export const SOL_PRICE_SOURCES = [
+  'current-quote',
+  'fresh-cache',
+  'configured-fallback',
+  'unavailable',
+] as const;
+
+export const PRIORITY_FEE_SOURCES = [
+  'dynamic_account_specific',
+  'dynamic_global',
+  'cached',
+  'static-fallback',
+] as const;
+
+export type SolPriceSourceLabel = (typeof SOL_PRICE_SOURCES)[number];
+export type PriorityFeeSourceLabel = (typeof PRIORITY_FEE_SOURCES)[number];
+
+export interface ReadinessHealth {
+  feeEstimation: {
+    attempted: number;
+    available: number;
+    unavailable: number;
+    /**
+     * Never infer this from the counters alone: all-zero counters are
+     * NOT_EXERCISED, which is a different claim from HEALTHY.
+     */
+    state: FeeEstimationState;
+    /** SOL/USD provenance distribution, keyed by SolPriceSource. */
+    priceSources: Record<SolPriceSourceLabel, number>;
+    /** Priority-fee provenance distribution, keyed by PriorityFeeEstimate['source']. */
+    feeSources: Record<PriorityFeeSourceLabel, number>;
+    /** Attempts where either axis fell back (configured-fallback / static-fallback). */
+    fallbackAttempts: number;
+    /** fallbackAttempts / attempted, or null when never exercised. */
+    fallbackRate: number | null;
+    source?: string | null;
+    feeSource?: string | null;
+    ageMs?: number | null;
+    estimatedFeeLamports?: number | null;
+    estimatedExecutionFeeUsd?: number | null;
+  };
+  poolResolution: { configured: number; resolved: number; unresolved: number };
+  observationPersistence: { attempted: number; succeeded: number; failed: number };
+  /** Requested swap builds, including Jupiter simulation; every settled attempt has one terminal result. */
+  simulation: { attempted: number; succeeded: number; failed: number };
+  sourceSha: string | null;
+  runtimeSha: string | null;
+  requiredSafetyConfiguration: boolean | null;
+}
+
+function zeroCounts<T extends readonly string[]>(keys: T): Record<T[number], number> {
+  return Object.fromEntries(keys.map((key) => [key, 0])) as Record<T[number], number>;
+}
+
+export function emptyFeeEstimationHealth(): ReadinessHealth['feeEstimation'] {
+  return {
+    attempted: 0,
+    available: 0,
+    unavailable: 0,
+    state: 'NOT_EXERCISED',
+    priceSources: zeroCounts(SOL_PRICE_SOURCES),
+    feeSources: zeroCounts(PRIORITY_FEE_SOURCES),
+    fallbackAttempts: 0,
+    fallbackRate: null,
+  };
+}
+
+/**
+ * Order matters. An unexercised estimator outranks every other claim because
+ * nothing was measured; an outright unavailable attempt outranks a merely
+ * degraded one. Fallback is reported, not punished -- the readiness verdict
+ * decides policy, this only refuses to call fallback "healthy".
+ */
+export function deriveFeeEstimationState(
+  fee: Pick<ReadinessHealth['feeEstimation'], 'attempted' | 'unavailable' | 'fallbackAttempts'>,
+): FeeEstimationState {
+  if (fee.attempted <= 0) return 'NOT_EXERCISED';
+  if (fee.unavailable > 0) return 'UNAVAILABLE';
+  if (fee.fallbackAttempts > 0) return 'DEGRADED_FALLBACK';
+  return 'HEALTHY';
+}
+
 export interface FeeNormStats {
   count: number;
   totalFeeBps: number;
@@ -118,10 +224,21 @@ export interface SessionSummary extends FunnelSnapshot {
   maxQuoteAgeMs: number | null;
   avgFeeBpsOfNotional: number | null;
   avgNetEdgeBpsOfNotional: number | null;
+  /** Expected economics, recorded at gate evaluation. Populated in log-only mode. */
   avgExpectedGrossUsd: number | null;
   avgExecutionFeeUsd: number | null;
   avgNetEdgeUsd: number | null;
   avgSlippageCostUsd: number | null;
+  /**
+   * Realized economics, recorded only for confirmed live submissions.
+   * Always null/zero on a log-only run -- that is the expected, correct state,
+   * not a bug. Never derive a canary verdict by comparing these against the
+   * expected fields above unless realizedTradeCount > 0.
+   */
+  avgRealizedGrossUsd: number | null;
+  avgRealizedExecutionFeeUsd: number | null;
+  avgRealizedNetEdgeUsd: number | null;
+  realizedTradeCount: number;
 }
 
 /**
@@ -150,6 +267,9 @@ export interface ShadowSnapshot extends SessionSummary {
   routeTypes: Record<string, number>;
   bestGrossOverallUsd: number;
   bestGrossPerPair: Record<string, number>;
+  /** Individual gate observations are the statistical readiness population. */
+  economicObservations: EconomicObservation[];
+  readinessHealth: ReadinessHealth;
 }
 
 // ── Config ─────────────────────────────────────────────────────────
@@ -157,6 +277,8 @@ export interface ShadowSnapshot extends SessionSummary {
 export interface SessionMetricsConfig {
   /** How often to emit a summary log (ms). Default: 600_000 (10 min). */
   summaryIntervalMs: number;
+  economicsJournalPath?: string;
+  clock?: () => number;
 }
 
 const DEFAULT_CONFIG: SessionMetricsConfig = {
@@ -263,7 +385,8 @@ function summariseLatency(acc: LatencyAccumulator): LatencyStats {
 
 export class SessionMetrics {
   private readonly config: SessionMetricsConfig;
-  private readonly startedAt = Date.now();
+  private readonly clock: () => number;
+  private readonly startedAt: number;
   private summaryTimer: ReturnType<typeof setInterval> | null = null;
 
   // Funnel counters
@@ -299,11 +422,17 @@ export class SessionMetrics {
   private feeNormMinBps = Infinity;
   private feeNormMaxBps = -Infinity;
 
-  // Gross / fee / net USD tracking (for averages)
+  // Gross / fee / net USD tracking (for averages) -- expected, gate-time
   private grossUsdTotal = 0;
   private executionFeeUsdTotal = 0;
   private netEdgeUsdTotal = 0;
   private tradeCount = 0;
+
+  // Realized economics -- only fed by confirmed, live-submitted trades
+  private realizedGrossUsdTotal = 0;
+  private realizedExecutionFeeUsdTotal = 0;
+  private realizedNetEdgeUsdTotal = 0;
+  private realizedTradeCount = 0;
 
   // Slippage cost tracking (separate count: not every gate eval yields an estimate)
   private slippageCostUsdTotal = 0;
@@ -334,9 +463,29 @@ export class SessionMetrics {
   // Best gross edge per pair (reset each summary interval)
   private bestGrossPerPair: Record<string, number> = {};
   private bestGrossOverall = 0;
+  private economicObservations: EconomicObservation[] = [];
+  private readonly economicsJournal: EconomicsJournal | null;
+  private readinessHealth: ReadinessHealth = {
+    feeEstimation: emptyFeeEstimationHealth(),
+    poolResolution: { configured: 0, resolved: 0, unresolved: 0 },
+    observationPersistence: { attempted: 0, succeeded: 0, failed: 0 },
+    simulation: { attempted: 0, succeeded: 0, failed: 0 },
+    sourceSha: null,
+    runtimeSha: null,
+    requiredSafetyConfiguration: null,
+  };
 
   constructor(config?: Partial<SessionMetricsConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
+    this.clock = this.config.clock ?? (() => Date.now());
+    this.startedAt = this.clock();
+    this.economicsJournal = this.config.economicsJournalPath
+      ? new EconomicsJournal(this.config.economicsJournalPath)
+      : null;
+  }
+
+  nowMs(): number {
+    return this.clock();
   }
 
   // ── Recording methods ──────────────────────────────────────────
@@ -372,6 +521,7 @@ export class SessionMetrics {
 
   recordSwapBuildAttempted(): void {
     this.swapBuildsAttempted++;
+    this.readinessHealth.simulation.attempted++;
   }
 
   recordSwapBuildLatency(ms: number): void {
@@ -438,10 +588,12 @@ export class SessionMetrics {
 
   recordSwapBuilt(): void {
     this.swapsBuilt++;
+    this.readinessHealth.simulation.succeeded++;
   }
 
   recordSwapBuildFailed(): void {
     this.swapBuildFailed++;
+    this.readinessHealth.simulation.failed++;
   }
 
   recordSubmitted(): void {
@@ -488,11 +640,149 @@ export class SessionMetrics {
     if (feeBps > this.feeNormMaxBps) this.feeNormMaxBps = feeBps;
   }
 
-  recordTradeEconomics(grossUsd: number, executionFeeUsd: number, netEdgeUsd: number): void {
-    this.grossUsdTotal += grossUsd;
-    this.executionFeeUsdTotal += executionFeeUsd;
-    this.netEdgeUsdTotal += netEdgeUsd;
-    this.tradeCount++;
+  /** Expected trade economics, recorded at gate evaluation (see #411). */
+  recordExpectedTradeEconomics(
+    grossUsd: number,
+    executionFeeUsd: number,
+    netEdgeUsd: number,
+    passed = false,
+    timestampMs = Date.now(),
+  ): void {
+    this.recordEconomicsObservation({
+      schemaVersion: 1,
+      timestampMs,
+      poolAddress: null,
+      pair: 'unknown',
+      ammLabel: 'unknown',
+      routeType: 'unknown',
+      notionalUsd: 0,
+      expectedGrossUsd: grossUsd,
+      estimatedExecutionFeeUsd: Number.isFinite(executionFeeUsd) ? executionFeeUsd : null,
+      estimatedSlippageCostUsd: null,
+      riskBufferUsd: 0,
+      executionHaircutUsd: 0,
+      netExpectedUsd: Number.isFinite(netEdgeUsd) ? netEdgeUsd : null,
+      edgeBps: null,
+      quoteAgeMs: null,
+      feeEstimateAvailable: Number.isFinite(executionFeeUsd),
+      feeEstimateSource: null,
+      feeEstimateAgeMs: null,
+      estimatedFeeLamports: null,
+      passed,
+      rejectReason: passed ? null : 'unknown',
+      simulationAttempted: false,
+      simulationSucceeded: false,
+      simulationFailureReason: null,
+    });
+  }
+
+  recordEconomicsObservation(observation: JournalObservation): void {
+    const usable = [
+      observation.expectedGrossUsd,
+      observation.notionalUsd,
+      observation.netExpectedUsd,
+    ].every((value) => value === null || Number.isFinite(value));
+    if (
+      usable &&
+      Number.isFinite(observation.expectedGrossUsd) &&
+      observation.netExpectedUsd !== null &&
+      Number.isFinite(observation.netExpectedUsd)
+    ) {
+      this.grossUsdTotal += observation.expectedGrossUsd;
+      this.executionFeeUsdTotal += observation.estimatedExecutionFeeUsd ?? 0;
+      this.netEdgeUsdTotal += observation.netExpectedUsd;
+      this.tradeCount++;
+    }
+    const observationUsable = [
+      observation.expectedGrossUsd,
+      observation.notionalUsd,
+      observation.netExpectedUsd,
+    ].every((value) => value !== null && Number.isFinite(value));
+    this.economicObservations.push({
+      timestampMs: observation.timestampMs,
+      netExpectedUsd: observation.netExpectedUsd,
+      usable: observationUsable,
+      passed: observation.passed,
+      journal: { ...observation },
+    });
+    try {
+      if (!this.economicsJournal) throw new Error('economics journal is not configured');
+      this.economicsJournal.append(observation);
+      this.recordObservationPersistence(true);
+    } catch {
+      this.recordObservationPersistence(false);
+    }
+  }
+
+  recordFeeEstimation(
+    available: boolean,
+    details: {
+      /** SOL/USD provenance for this attempt. */
+      source?: string | null;
+      /** Priority-fee provenance; absent when the estimator never ran. */
+      feeSource?: string | null;
+      ageMs?: number | null;
+      estimatedFeeLamports?: number | null;
+      estimatedExecutionFeeUsd?: number | null;
+    } = {},
+  ): void {
+    const fee = this.readinessHealth.feeEstimation;
+    fee.attempted++;
+    if (available) fee.available++;
+    else fee.unavailable++;
+
+    const priceSource = details.source;
+    if (priceSource && priceSource in fee.priceSources) {
+      fee.priceSources[priceSource as SolPriceSourceLabel]++;
+    }
+    const feeSource = details.feeSource;
+    if (feeSource && feeSource in fee.feeSources) {
+      fee.feeSources[feeSource as PriorityFeeSourceLabel]++;
+    }
+    // One attempt counts once even if both axes fell back.
+    if (priceSource === 'configured-fallback' || feeSource === 'static-fallback') {
+      fee.fallbackAttempts++;
+    }
+
+    Object.assign(fee, details);
+    fee.fallbackRate = fee.attempted > 0 ? fee.fallbackAttempts / fee.attempted : null;
+    fee.state = deriveFeeEstimationState(fee);
+  }
+
+  publishPoolResolution(configured: number, resolved: number): void {
+    this.readinessHealth.poolResolution = {
+      configured,
+      resolved,
+      unresolved: Math.max(0, configured - resolved),
+    };
+  }
+
+  recordObservationPersistence(success: boolean): void {
+    this.readinessHealth.observationPersistence.attempted++;
+    if (success) this.readinessHealth.observationPersistence.succeeded++;
+    else this.readinessHealth.observationPersistence.failed++;
+  }
+
+  publishReadinessProvenance(sourceSha: string | null, runtimeSha: string | null): void {
+    this.readinessHealth.sourceSha = sourceSha;
+    this.readinessHealth.runtimeSha = runtimeSha;
+  }
+
+  publishSafetyConfiguration(valid: boolean): void {
+    this.readinessHealth.requiredSafetyConfiguration = valid;
+  }
+
+  /**
+   * Realized trade economics, recorded only for a confirmed, live-submitted
+   * trade. Kept in separate accumulators from {@link recordExpectedTradeEconomics} so
+   * a shadow run's estimates and a canary's actuals are never averaged
+   * together into one number.
+   */
+  recordRealizedTradeEconomics(grossUsd: number, executionFeeUsd: number, netEdgeUsd: number): void {
+    this.realizedGrossUsdTotal += grossUsd;
+    this.realizedExecutionFeeUsdTotal += executionFeeUsd;
+    this.realizedNetEdgeUsdTotal += netEdgeUsd;
+    this.realizedTradeCount++;
   }
 
   recordGrossEdge(pairLabel: string, grossUsd: number): void {
@@ -531,7 +821,7 @@ export class SessionMetrics {
 
   getSummary(): SessionSummary {
     const funnel = this.getFunnelSnapshot();
-    const durationSec = (Date.now() - this.startedAt) / 1000;
+    const durationSec = (this.clock() - this.startedAt) / 1000;
 
     return {
       ...funnel,
@@ -559,6 +849,16 @@ export class SessionMetrics {
       avgSlippageCostUsd: this.slippageCostCount > 0
         ? +(this.slippageCostUsdTotal / this.slippageCostCount).toFixed(6)
         : null,
+      avgRealizedGrossUsd: this.realizedTradeCount > 0
+        ? +(this.realizedGrossUsdTotal / this.realizedTradeCount).toFixed(6)
+        : null,
+      avgRealizedExecutionFeeUsd: this.realizedTradeCount > 0
+        ? +(this.realizedExecutionFeeUsdTotal / this.realizedTradeCount).toFixed(6)
+        : null,
+      avgRealizedNetEdgeUsd: this.realizedTradeCount > 0
+        ? +(this.realizedNetEdgeUsdTotal / this.realizedTradeCount).toFixed(6)
+        : null,
+      realizedTradeCount: this.realizedTradeCount,
     };
   }
 
@@ -573,7 +873,7 @@ export class SessionMetrics {
       ...this.getSummary(),
       schemaVersion: 1,
       startedAtIso: new Date(this.startedAt).toISOString(),
-      capturedAtIso: new Date().toISOString(),
+      capturedAtIso: new Date(this.clock()).toISOString(),
       quoteLatency: summariseLatency(this.quoteLatency),
       swapBuildLatency: summariseLatency(this.swapBuildLatency),
       rpc: {
@@ -594,6 +894,22 @@ export class SessionMetrics {
       routeTypes: { ...this.routeTypes },
       bestGrossOverallUsd: +this.bestGrossOverall.toFixed(6),
       bestGrossPerPair: { ...this.bestGrossPerPair },
+      economicObservations: this.economicObservations.map((observation) => ({ ...observation })),
+      readinessHealth: {
+        feeEstimation: {
+          ...this.readinessHealth.feeEstimation,
+          // Nested counters need their own copies, or a later attempt mutates
+          // a snapshot that was already handed out.
+          priceSources: { ...this.readinessHealth.feeEstimation.priceSources },
+          feeSources: { ...this.readinessHealth.feeEstimation.feeSources },
+        },
+        poolResolution: { ...this.readinessHealth.poolResolution },
+        observationPersistence: { ...this.readinessHealth.observationPersistence },
+        simulation: { ...this.readinessHealth.simulation },
+        sourceSha: this.readinessHealth.sourceSha,
+        runtimeSha: this.readinessHealth.runtimeSha,
+        requiredSafetyConfiguration: this.readinessHealth.requiredSafetyConfiguration,
+      },
     };
   }
 

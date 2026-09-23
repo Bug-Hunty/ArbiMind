@@ -1,6 +1,22 @@
 import { loadEnv } from './bootstrapEnv';
+import { assertRequiredNodeVersion } from './RuntimeVersionGuard';
+import { assertExecutionProvenance, readRuntimeProvenance } from './solana/RuntimeProvenance';
+import { readEvmSubsystemState } from './config/subsystems';
 
 console.error(`[BOOT] ArbiMind bot process start pid=${process.pid} node=${process.version} ts=${new Date().toISOString()}`);
+
+try {
+  const runtime = assertRequiredNodeVersion();
+  console.error(
+    `[BOOT] runtime guard passed requiredNodeVersion=${runtime.requiredNodeVersion} ` +
+      `actualNodeVersion=${runtime.actualNodeVersion}`,
+  );
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`[FATAL] ${message}`);
+  process.exitCode = 1;
+  throw error;
+}
 
 try {
   loadEnv();
@@ -8,6 +24,21 @@ try {
 } catch (error) {
   const message = error instanceof Error ? error.stack || error.message : String(error);
   console.error(`env bootstrap failed: ${message}`);
+}
+
+// Check before services start and outside the LOG_ONLY graceful-error handler.
+try {
+  const provenance = readRuntimeProvenance();
+  assertExecutionProvenance(provenance, false);
+  console.error(
+    `[BOOT] provenance PASS sourceSha=${provenance.sourceSha} runtimeSha=${provenance.runtimeSha} ` +
+      `node=${provenance.nodeVersion}`,
+  );
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`[FATAL] ${message}`);
+  process.exitCode = 1;
+  throw error;
 }
 
 function isValidPrivateKey(value: string): boolean {
@@ -31,20 +62,6 @@ function isEnvTrue(value: string | undefined): boolean {
   return normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'on';
 }
 
-function isEnvFalse(value: string | undefined): boolean {
-  const normalized = normalizeEnvValue(value).toLowerCase();
-  return normalized === 'false' || normalized === '0' || normalized === 'no' || normalized === 'off';
-}
-
-function shouldGracefulExitFromEnv(): boolean {
-  if (isEnvTrue(process.env['LOG_ONLY']) || isEnvTrue(process.env['BOT_LOG_ONLY'])) {
-    return true;
-  }
-  const isTestnet = normalizeEnvValue(process.env['NETWORK'] || 'mainnet').toLowerCase() === 'testnet';
-  const allowTestnetTrades = isEnvTrue(process.env['ALLOW_TESTNET_TRADES']);
-  return isTestnet && !allowTestnetTrades;
-}
-
 function waitForShutdownSignal(): Promise<void> {
   return new Promise<void>((resolve) => {
     const onSignal = () => {
@@ -59,6 +76,7 @@ function waitForShutdownSignal(): Promise<void> {
 
 async function main(): Promise<void> {
   try {
+    const { scannerEnabled: evmScannerEnabled, enabled: evmEnabled } = readEvmSubsystemState();
     console.error('[BOOT] importing ethers');
     const { ethers } = await import('ethers');
     console.error('[BOOT] imported ethers');
@@ -75,10 +93,6 @@ async function main(): Promise<void> {
     const loggerModule = await import('./utils/Logger.js');
     console.error('[BOOT] imported utils/Logger');
 
-    console.error('[BOOT] importing services/ArbitrageBot');
-    const botModule = await import('./services/ArbitrageBot.js');
-    console.error('[BOOT] imported services/ArbitrageBot');
-
     console.error('[BOOT] importing solana/Scanner');
     const solanaModule = await import('./solana/Scanner.js');
     console.error('[BOOT] imported solana/Scanner');
@@ -94,9 +108,8 @@ async function main(): Promise<void> {
     const { refreshConfig, validateConfig, config } = configModule;
     const { getIdentitySource, shortAddress } = identityModule;
     const { Logger } = loggerModule;
-    const { ArbitrageBot } = botModule;
     const { SolanaScanner } = solanaModule;
-    const { solanaExecutorConfig } = solanaConfigModule;
+    const { solanaConfig, solanaExecutorConfig } = solanaConfigModule;
     const { checkSolanaRpcHealth } = solanaRpcGuardModule;
 
     const logger = new Logger('Main');
@@ -110,6 +123,12 @@ async function main(): Promise<void> {
     validateConfig();
     logger.info('✅ Configuration validated');
 
+    // No-scanner/no-execution mode is a clean exit, without providers or service timers.
+    if (!evmEnabled && !solanaConfig.enabled) {
+      logger.info('No subsystems enabled; exiting without starting services');
+      return;
+    }
+
     // Log selected chain
     logger.info(`📡 Selected chain: ${config.evmChain} (chainId=${config.evmChainId})`);
     logger.info(`🌐 RPC: ${config.ethereumRpcUrl.split('/').slice(0, 3).join('/')}/...`);
@@ -117,14 +136,13 @@ async function main(): Promise<void> {
       logger.info('📊 Running in LOG_ONLY mode (no trades will be executed)');
     }
 
-    const evmScannerEnabled = !isEnvFalse(process.env['EVM_SCANNER_ENABLED']);
     if (!evmScannerEnabled) {
       logger.warn('⏸️ EVM scanner disabled by EVM_SCANNER_ENABLED=false; Solana scanner remains active');
     }
 
     const privateKey = config.privateKey?.trim() || '';
     const walletAddressEnv = config.walletAddress?.trim() || '';
-    const hasPrivateKey = isValidPrivateKey(privateKey);
+    const hasPrivateKey = evmEnabled && isValidPrivateKey(privateKey);
     const identitySource = getIdentitySource({
       hasWallet: hasPrivateKey,
       walletAddress: walletAddressEnv,
@@ -153,7 +171,9 @@ async function main(): Promise<void> {
       canaryMode: solanaExecutorConfig.canaryMode,
     });
 
-    const solanaRpcGuard = await checkSolanaRpcHealth(solanaExecutorConfig);
+    const solanaRpcGuard = solanaConfig.enabled
+      ? await checkSolanaRpcHealth(solanaExecutorConfig)
+      : { config: solanaExecutorConfig, healthy: false, forced: false, slotAtCheck: undefined };
     Object.assign(solanaExecutorConfig, solanaRpcGuard.config);
     if (solanaRpcGuard.forced) {
       logger.error('⚠️ Solana trading was enabled but RPC is unhealthy; forcing LOG_ONLY mode');
@@ -187,45 +207,49 @@ async function main(): Promise<void> {
       solanaRpcSlotAtCheck: solanaRpcGuard.slotAtCheck,
     }));
 
-    // Create the arbitrage bot (EVM scanner can be disabled via env)
-    const bot = new ArbitrageBot();
+    // Inactive EVM must not construct providers, wallets or execution services.
+    let bot: import('./services/ArbitrageBot').ArbitrageBot | undefined;
+    if (evmEnabled) {
+      console.error('[BOOT] importing services/ArbitrageBot');
+      const { ArbitrageBot } = await import('./services/ArbitrageBot.js');
+      console.error('[BOOT] imported services/ArbitrageBot');
+      bot = new ArbitrageBot();
+    } else {
+      console.error('[BOOT] EVM subsystem disabled; startup skipped');
+    }
     
     // Create and start the Solana scanner
-    const solanaScanner = new SolanaScanner();
-    solanaScanner.start();
+    const solanaScanner = solanaConfig.enabled ? new SolanaScanner() : undefined;
+    solanaScanner?.start();
     
     // Handle graceful shutdown
-    process.on('SIGINT', () => {
+    process.on('SIGINT', async () => {
       logger.info('🛑 Received SIGINT, shutting down gracefully...');
-      bot.stop();
-      solanaScanner.stop();
+      bot?.stop();
+      await solanaScanner?.stop();
       process.exit(0);
     });
 
-    process.on('SIGTERM', () => {
+    process.on('SIGTERM', async () => {
       logger.info('🛑 Received SIGTERM, shutting down gracefully...');
-      bot.stop();
-      solanaScanner.stop();
+      bot?.stop();
+      await solanaScanner?.stop();
       process.exit(0);
     });
 
     // Start scanners based on runtime toggles
     if (evmScannerEnabled) {
-      await bot.start();
+      await bot!.start();
     } else {
-      logger.info('EVM scanner start skipped (EVM_SCANNER_ENABLED=false); process kept alive by Solana scanner loop');
+      logger.info(solanaConfig.enabled
+        ? 'EVM scanner start skipped (EVM_SCANNER_ENABLED=false); process kept alive by Solana scanner loop'
+        : 'All scanners disabled; waiting for shutdown');
       await waitForShutdownSignal();
     }
 
   } catch (error) {
-    const shouldGracefulExit = shouldGracefulExitFromEnv();
     const message = error instanceof Error ? error.stack || error.message : String(error);
     console.error(`[FATAL] bot startup error @ ${new Date().toISOString()} error=${message}`);
-
-    if (shouldGracefulExit) {
-      console.warn('⚠️ Startup failed in LOG_ONLY mode. Exiting gracefully to avoid restart loop.');
-      process.exit(0);
-    }
 
     process.exit(1);
   }

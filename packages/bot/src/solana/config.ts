@@ -68,6 +68,7 @@ export interface SolanaExecutorRuntimeConfig {
   takeProfitPct: number;
   maxSlippageBps: number;
   quoteMaxAgeMs: number;
+  solPriceUsd: number;
   rpcUrl: string;
   privateKeyBase58: string;
   jupiterBaseUrl: string;
@@ -164,15 +165,13 @@ export const solanaExecutorConfig: SolanaExecutorRuntimeConfig = {
   takeProfitPct: parsePercent(process.env['SOLANA_TAKE_PROFIT_PCT'], 0),
   maxSlippageBps: parseNumber(process.env['SOLANA_MAX_SLIPPAGE_BPS'] || process.env['MAX_SLIPPAGE_BPS'], 50),
   quoteMaxAgeMs: parseNumber(process.env['QUOTE_MAX_AGE_MS'], 2_000),
+  solPriceUsd: parseNumber(process.env['SOLANA_SOL_PRICE_USD'], 0),
   rpcUrl:
     process.env['SOLANA_RPC_URL_MAINNET_BETA'] ||
     process.env['SOLANA_RPC_URL'] ||
     '',
   privateKeyBase58:
     process.env['SOLANA_PRIVATE_KEY_BASE58'] ||
-    process.env['SOLANA_PRIVATE_KEY_BASE58Y_BASE58'] ||
-    process.env['SOLANA_ARB_SECRET_KEY'] ||
-    process.env['SOLANA_TREASURY_SECRET_KEY'] ||
     '',
   jupiterBaseUrl: process.env['JUPITER_BASE_URL'] || 'https://lite-api.jup.ag/swap/v1',
   riskPolicy: {
