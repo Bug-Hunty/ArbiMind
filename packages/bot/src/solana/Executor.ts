@@ -633,6 +633,9 @@ export class SolanaExecutor {
       let estimatedExecutionFeeUsd = 0;
       let feeEstimateAvailable = false;
       let estimatedFeeLamports: number | null = null;
+      // The priority-fee estimator's own provenance, distinct from the SOL
+      // price's. Stays null when the estimator never ran or threw.
+      let priorityFeeSource: PriorityFeeEstimate['source'] | null = null;
 
       if (solPriceUsd > 0 && connection) {
         try {
@@ -656,6 +659,7 @@ export class SolanaExecutor {
           const totalFeeLamports = estimatedPriorityFeeLamports + 5000;
           estimatedFeeLamports = totalFeeLamports;
           estimatedExecutionFeeUsd = (totalFeeLamports / 1e9) * solPriceUsd;
+          priorityFeeSource = feeEst.source;
           feeEstimateAvailable = Number.isFinite(estimatedExecutionFeeUsd) && estimatedExecutionFeeUsd >= 0;
         } catch {
           // Can't estimate → use fallback
@@ -676,6 +680,7 @@ export class SolanaExecutor {
       };
       this.sessionMetrics.recordFeeEstimation(feeEstimateAvailable, {
         source: solPrice.source,
+        feeSource: priorityFeeSource,
         ageMs: solPrice.ageMs,
         estimatedFeeLamports,
         estimatedExecutionFeeUsd: feeEstimateAvailable ? estimatedExecutionFeeUsd : null,

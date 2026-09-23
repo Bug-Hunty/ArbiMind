@@ -112,12 +112,58 @@ export interface EconomicObservation {
   journal: JournalObservation;
 }
 
+/**
+ * Two independent provenances feed one execution-fee estimate, and conflating
+ * them is what made degradation invisible: `source` below is the SOL/USD
+ * price's origin, never the priority-fee estimator's. Both are counted.
+ */
+export type FeeEstimationState =
+  /** attempted === 0. No estimate ever ran, so nothing is known -- not health. */
+  | 'NOT_EXERCISED'
+  /** Every attempt used live/current inputs on both axes. */
+  | 'HEALTHY'
+  /** Estimates were produced, but some leaned on a fallback input. */
+  | 'DEGRADED_FALLBACK'
+  /** At least one attempt could not produce an estimate at all. */
+  | 'UNAVAILABLE';
+
+export const SOL_PRICE_SOURCES = [
+  'current-quote',
+  'fresh-cache',
+  'configured-fallback',
+  'unavailable',
+] as const;
+
+export const PRIORITY_FEE_SOURCES = [
+  'dynamic_account_specific',
+  'dynamic_global',
+  'cached',
+  'static-fallback',
+] as const;
+
+export type SolPriceSourceLabel = (typeof SOL_PRICE_SOURCES)[number];
+export type PriorityFeeSourceLabel = (typeof PRIORITY_FEE_SOURCES)[number];
+
 export interface ReadinessHealth {
   feeEstimation: {
     attempted: number;
     available: number;
     unavailable: number;
+    /**
+     * Never infer this from the counters alone: all-zero counters are
+     * NOT_EXERCISED, which is a different claim from HEALTHY.
+     */
+    state: FeeEstimationState;
+    /** SOL/USD provenance distribution, keyed by SolPriceSource. */
+    priceSources: Record<SolPriceSourceLabel, number>;
+    /** Priority-fee provenance distribution, keyed by PriorityFeeEstimate['source']. */
+    feeSources: Record<PriorityFeeSourceLabel, number>;
+    /** Attempts where either axis fell back (configured-fallback / static-fallback). */
+    fallbackAttempts: number;
+    /** fallbackAttempts / attempted, or null when never exercised. */
+    fallbackRate: number | null;
     source?: string | null;
+    feeSource?: string | null;
     ageMs?: number | null;
     estimatedFeeLamports?: number | null;
     estimatedExecutionFeeUsd?: number | null;
@@ -129,6 +175,38 @@ export interface ReadinessHealth {
   sourceSha: string | null;
   runtimeSha: string | null;
   requiredSafetyConfiguration: boolean | null;
+}
+
+function zeroCounts<T extends readonly string[]>(keys: T): Record<T[number], number> {
+  return Object.fromEntries(keys.map((key) => [key, 0])) as Record<T[number], number>;
+}
+
+export function emptyFeeEstimationHealth(): ReadinessHealth['feeEstimation'] {
+  return {
+    attempted: 0,
+    available: 0,
+    unavailable: 0,
+    state: 'NOT_EXERCISED',
+    priceSources: zeroCounts(SOL_PRICE_SOURCES),
+    feeSources: zeroCounts(PRIORITY_FEE_SOURCES),
+    fallbackAttempts: 0,
+    fallbackRate: null,
+  };
+}
+
+/**
+ * Order matters. An unexercised estimator outranks every other claim because
+ * nothing was measured; an outright unavailable attempt outranks a merely
+ * degraded one. Fallback is reported, not punished -- the readiness verdict
+ * decides policy, this only refuses to call fallback "healthy".
+ */
+export function deriveFeeEstimationState(
+  fee: Pick<ReadinessHealth['feeEstimation'], 'attempted' | 'unavailable' | 'fallbackAttempts'>,
+): FeeEstimationState {
+  if (fee.attempted <= 0) return 'NOT_EXERCISED';
+  if (fee.unavailable > 0) return 'UNAVAILABLE';
+  if (fee.fallbackAttempts > 0) return 'DEGRADED_FALLBACK';
+  return 'HEALTHY';
 }
 
 export interface FeeNormStats {
@@ -388,7 +466,7 @@ export class SessionMetrics {
   private economicObservations: EconomicObservation[] = [];
   private readonly economicsJournal: EconomicsJournal | null;
   private readinessHealth: ReadinessHealth = {
-    feeEstimation: { attempted: 0, available: 0, unavailable: 0 },
+    feeEstimation: emptyFeeEstimationHealth(),
     poolResolution: { configured: 0, resolved: 0, unresolved: 0 },
     observationPersistence: { attempted: 0, succeeded: 0, failed: 0 },
     simulation: { attempted: 0, succeeded: 0, failed: 0 },
@@ -639,16 +717,36 @@ export class SessionMetrics {
   recordFeeEstimation(
     available: boolean,
     details: {
+      /** SOL/USD provenance for this attempt. */
       source?: string | null;
+      /** Priority-fee provenance; absent when the estimator never ran. */
+      feeSource?: string | null;
       ageMs?: number | null;
       estimatedFeeLamports?: number | null;
       estimatedExecutionFeeUsd?: number | null;
     } = {},
   ): void {
-    this.readinessHealth.feeEstimation.attempted++;
-    if (available) this.readinessHealth.feeEstimation.available++;
-    else this.readinessHealth.feeEstimation.unavailable++;
-    Object.assign(this.readinessHealth.feeEstimation, details);
+    const fee = this.readinessHealth.feeEstimation;
+    fee.attempted++;
+    if (available) fee.available++;
+    else fee.unavailable++;
+
+    const priceSource = details.source;
+    if (priceSource && priceSource in fee.priceSources) {
+      fee.priceSources[priceSource as SolPriceSourceLabel]++;
+    }
+    const feeSource = details.feeSource;
+    if (feeSource && feeSource in fee.feeSources) {
+      fee.feeSources[feeSource as PriorityFeeSourceLabel]++;
+    }
+    // One attempt counts once even if both axes fell back.
+    if (priceSource === 'configured-fallback' || feeSource === 'static-fallback') {
+      fee.fallbackAttempts++;
+    }
+
+    Object.assign(fee, details);
+    fee.fallbackRate = fee.attempted > 0 ? fee.fallbackAttempts / fee.attempted : null;
+    fee.state = deriveFeeEstimationState(fee);
   }
 
   publishPoolResolution(configured: number, resolved: number): void {
@@ -798,7 +896,13 @@ export class SessionMetrics {
       bestGrossPerPair: { ...this.bestGrossPerPair },
       economicObservations: this.economicObservations.map((observation) => ({ ...observation })),
       readinessHealth: {
-        feeEstimation: { ...this.readinessHealth.feeEstimation },
+        feeEstimation: {
+          ...this.readinessHealth.feeEstimation,
+          // Nested counters need their own copies, or a later attempt mutates
+          // a snapshot that was already handed out.
+          priceSources: { ...this.readinessHealth.feeEstimation.priceSources },
+          feeSources: { ...this.readinessHealth.feeEstimation.feeSources },
+        },
         poolResolution: { ...this.readinessHealth.poolResolution },
         observationPersistence: { ...this.readinessHealth.observationPersistence },
         simulation: { ...this.readinessHealth.simulation },

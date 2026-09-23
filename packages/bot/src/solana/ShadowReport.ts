@@ -245,8 +245,18 @@ export function deriveRecommendation(snapshot: ShadowSnapshot): ShadowRecommenda
   if (rpcRate === null || rpcRate > READINESS.maxRpcFailureRate) blockers.push(`RPC failure/rate limiting rate ${pct(rpcRate)} is unavailable or exceeds ${pct(READINESS.maxRpcFailureRate)}`);
   if (health === undefined) blockers.push('readiness health is absent (legacy snapshot)');
   else {
-    const feeRate = rate(health.feeEstimation.unavailable, health.feeEstimation.attempted);
-    if (feeRate === null || feeRate > 0.05) blockers.push('fee estimation is unavailable or outside tolerance');
+    const fee = health.feeEstimation;
+    const feeRate = rate(fee.unavailable, fee.attempted);
+    // Naming the two cases apart matters: "never ran" and "ran and failed too
+    // often" are both blocking, but only one of them is evidence about the
+    // estimator. A run with no market opportunity produces the first.
+    if (fee.state === 'NOT_EXERCISED' || feeRate === null) {
+      blockers.push(
+        `fee estimation was never exercised (attempted=${fee.attempted}) — its health is unknown, not healthy`,
+      );
+    } else if (feeRate > 0.05) {
+      blockers.push(`fee estimation unavailable rate ${pct(feeRate)} exceeds 5%`);
+    }
     if (health.poolResolution.configured <= 0 || health.poolResolution.unresolved > 0) blockers.push('configured pools are unresolved');
     if (health.observationPersistence.attempted <= 0 || health.observationPersistence.failed > 0) blockers.push('observation persistence is not healthy');
     // A snapshot taken during a build (or with a lost terminal event) cannot
@@ -367,6 +377,35 @@ export function renderShadowReport(snapshot: ShadowSnapshot): string {
   push('failed', String(snapshot.swapBuildFailed));
   push('success rate', pct(swapBuildSuccessRate));
   lines.push('');
+
+  // Fee estimation leans on two independent inputs, and a run can produce
+  // estimates all day on fallback values. Printing the state and the source
+  // split keeps "no errors" from reading as "live pricing".
+  const feeHealth = snapshot.readinessHealth?.feeEstimation;
+  if (feeHealth) {
+    lines.push('fee estimation:');
+    push('state', feeHealth.state ?? '(not recorded — legacy snapshot)');
+    push('attempted', String(feeHealth.attempted));
+    push('available', String(feeHealth.available));
+    push('unavailable', String(feeHealth.unavailable));
+    if (feeHealth.fallbackAttempts !== undefined) {
+      push('fallback attempts', `${feeHealth.fallbackAttempts} (${pct(feeHealth.fallbackRate ?? null)})`);
+    }
+    // A legacy snapshot predates these counters; render it as absent rather
+    // than throwing on the report path.
+    const split = (counts: Record<string, number> | undefined): string[] =>
+      Object.entries(counts ?? {})
+        .filter(([, count]) => count > 0)
+        .map(([label, count]) => `${label}=${count}`);
+    const priceSplit = split(feeHealth.priceSources);
+    const feeSplit = split(feeHealth.feeSources);
+    push('sol price source', priceSplit.join(', ') || '(none recorded)');
+    push('priority fee source', feeSplit.join(', ') || '(none recorded)');
+    if (feeHealth.state === 'NOT_EXERCISED') {
+      lines.push('  ^ never exercised — this is unknown, not healthy');
+    }
+    lines.push('');
+  }
 
   lines.push('gate pass rate:');
   push('evaluated', String(snapshot.gateEvaluated));
