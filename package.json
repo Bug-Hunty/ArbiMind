@@ -18,6 +18,7 @@
     "test": "npm run test --workspaces",
     "lint": "pnpm run lint:ui",
     "lint:ui": "pnpm --filter @arbimind/ui lint",
+    "lint:bot": "pnpm --filter @arbimind/bot lint",
     "lint:contracts": "pnpm --filter @arbimind/contracts lint",
     "lint:ts": "pnpm --filter @arbimind/backend lint && pnpm --filter @arbimind/bot lint",
     "typecheck": "pnpm --filter @arbimind/backend typecheck && pnpm --filter @arbimind/bot typecheck && pnpm --filter @arbimind/ui type-check",
