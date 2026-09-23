@@ -632,7 +632,6 @@ export class SolanaExecutor {
       const solPriceUsd = solPrice.priceUsd ?? 0;
       let estimatedExecutionFeeUsd = 0;
       let feeEstimateAvailable = false;
-      let feeEstimateSource: string | null = null;
       let estimatedFeeLamports: number | null = null;
 
       if (solPriceUsd > 0 && connection) {
@@ -657,7 +656,6 @@ export class SolanaExecutor {
           const totalFeeLamports = estimatedPriorityFeeLamports + 5000;
           estimatedFeeLamports = totalFeeLamports;
           estimatedExecutionFeeUsd = (totalFeeLamports / 1e9) * solPriceUsd;
-          feeEstimateSource = feeEst.source;
           feeEstimateAvailable = Number.isFinite(estimatedExecutionFeeUsd) && estimatedExecutionFeeUsd >= 0;
         } catch {
           // Can't estimate → use fallback
