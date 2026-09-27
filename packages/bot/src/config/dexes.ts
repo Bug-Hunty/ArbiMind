@@ -1,4 +1,5 @@
 import { getAddress } from 'ethers';
+import { readEvmSubsystemState } from './subsystems';
 
 export interface DexConfig {
   name: string;
@@ -223,6 +224,7 @@ function validateDexAddresses(dexConfig: Record<string, DexConfig>, label: strin
 }
 
 function resolveDexConfig(): Record<string, DexConfig> {
+  if (!readEvmSubsystemState().enabled) return {};
   if (isArbitrumProfile()) return validateDexAddresses(buildArbitrumDexConfig(), 'Arbitrum');
   if (isEthereumSepoliaProfile()) return validateDexAddresses(buildSepoliaDexConfig(), 'Sepolia');
   return validateDexAddresses(DEFAULT_DEX_CONFIG, 'Ethereum');

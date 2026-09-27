@@ -11,6 +11,9 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'fs';
+import os from 'os';
+import path from 'path';
 
 // ── Solana web3 stub ───────────────────────────────────────────────
 // Connection and VersionedTransaction are replaced; Keypair/PublicKey stay
@@ -42,6 +45,32 @@ const { sendTransaction, confirmTransaction, getLatestBlockhash, signedTransacti
   }),
 );
 
+const journalFiles = vi.hoisted(() => ({ roots: new Set<string>(), files: new Map<string, Buffer>() }));
+vi.mock('fs', async () => {
+  const actual = await vi.importActual<typeof import('fs')>('fs');
+  const { journalFilesystem } = await import('../mocks/journal-filesystem');
+  return journalFilesystem(actual, journalFiles);
+});
+
+/**
+ * Silence the winston logger for this file.
+ *
+ * The readiness-reachability test below drives the executor through 200+ gate
+ * evaluations, each emitting several structured log lines. Left unsilenced that
+ * floods vitest's console-log RPC (observed: `EnvironmentTeardownError: Closing
+ * rpc while "onUserConsoleLog" was pending`) and loads the run enough to trip
+ * unrelated env-sensitive tests in other files. A test must not destabilise the
+ * suite it runs in.
+ */
+vi.mock('../../src/utils/Logger', () => ({
+  Logger: class {
+    info(): void {}
+    warn(): void {}
+    error(): void {}
+    debug(): void {}
+  },
+}));
+
 vi.mock('@solana/web3.js', async () => {
   const actual = await vi.importActual<typeof import('@solana/web3.js')>('@solana/web3.js');
   // Declared inside the factory: the executor calls `new Connection(...)`, so
@@ -64,11 +93,15 @@ vi.mock('@solana/web3.js', async () => {
   };
 });
 
-import { Keypair } from '@solana/web3.js';
+import { Keypair, VersionedTransaction } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { SolanaExecutor, classifyQuoteError } from '../../src/solana/Executor';
 import type { SolanaExecutorConfig, SwapOpportunity } from '../../src/solana/Executor';
 import { SessionMetrics } from '../../src/solana/SessionMetrics';
+import { calculateEconomicStatistics, deriveRecommendation, READINESS } from '../../src/solana/ShadowReport';
+import { EconomicsJournal } from '../../src/solana/EconomicsJournal';
+import { SolPriceResolver } from '../../src/solana/SolPriceResolver';
+import { publishPoolResolution, publishRuntimeProvenance, publishSafetyConfiguration } from '../../src/solana/ReadinessProducers';
 
 // ── Fixtures ───────────────────────────────────────────────────────
 
@@ -110,6 +143,7 @@ function makeConfig(overrides: Partial<SolanaExecutorConfig> = {}): SolanaExecut
     takeProfitPct: 0,
     maxSlippageBps: 50,
     quoteMaxAgeMs: 10_000,
+    solPriceUsd: 150,
     rpcUrl: 'http://localhost:8899',
     privateKeyBase58: generateSignerBase58(),
     jupiterBaseUrl: 'https://jupiter.invalid',
@@ -149,8 +183,10 @@ function makeOpportunity(overrides: Partial<SwapOpportunity> = {}): SwapOpportun
 }
 
 /** Jupiter quote + swap responses, routed by URL. */
+type MockResponse = Pick<Response, 'ok' | 'status' | 'json'> & Partial<Pick<Response, 'text'>>;
+
 function installFetchMock(): ReturnType<typeof vi.fn> {
-  const fetchMock = vi.fn(async (input: unknown) => {
+  const fetchMock = vi.fn(async (input: unknown): Promise<MockResponse> => {
     const url = String(input);
     if (url.includes('/quote')) {
       return {
@@ -182,6 +218,56 @@ function installFetchMock(): ReturnType<typeof vi.fn> {
   return fetchMock;
 }
 
+const readinessDirectories: string[] = [];
+
+function readinessMetrics(clock?: () => number): { metrics: SessionMetrics; journalPath: string } {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'arbimind-readiness-'));
+  readinessDirectories.push(directory);
+  journalFiles.roots.add(directory);
+  const journalPath = path.join(directory, 'economics.jsonl');
+  return { metrics: new SessionMetrics({ clock, economicsJournalPath: journalPath }), journalPath };
+}
+
+/** Input events traverse the real executor, producers, journal and snapshot. */
+async function healthyReadinessFixture() {
+  const fetchMock = installFetchMock();
+  const end = Date.now();
+  const start = end - 30 * 3_600_000;
+  let now = start;
+  const { metrics, journalPath } = readinessMetrics(() => now);
+  metrics.setAiScoringMode('local');
+  publishRuntimeProvenance(metrics, {
+    sourceSha: 'test-sha', runtimeSha: 'test-sha', nodeVersion: process.version,
+    startedAtIso: new Date(start).toISOString(), buildAtIso: new Date(start).toISOString(),
+  });
+  publishSafetyConfiguration(metrics, true);
+  publishPoolResolution(metrics, { configured: 1, resolved: 1 });
+  const executor = new SolanaExecutor(makeConfig({ logOnly: true }), undefined, {
+    gateConfig: PERMISSIVE_GATE, sessionMetrics: metrics,
+  });
+  const count = READINESS.minGateEvaluations + 5;
+  for (let i = 0; i < count; i++) {
+    now = start + i * (end - start) / (count - 1);
+    expect((await executor.execute(makeOpportunity())).logOnly).toBe(true);
+  }
+  expect(deriveRecommendation(metrics.getShadowSnapshot()).verdict).toBe('ready for $1 canary');
+  return { metrics, executor, fetchMock, journalPath, count };
+}
+
+function replaceSwapResponse(fetchMock: ReturnType<typeof vi.fn>, response: () => Promise<MockResponse>): void {
+  const original = fetchMock.getMockImplementation()!;
+  fetchMock.mockImplementation((input: unknown) => String(input).includes('/swap') ? response() : original(input));
+}
+
+function expectBuildHealth(metrics: SessionMetrics, attempted: number, succeeded: number, failed: number): void {
+  const health = metrics.getShadowSnapshot().readinessHealth.simulation;
+  expect(health).toEqual({ attempted, succeeded, failed });
+  expect(health.attempted).toBe(health.succeeded + health.failed);
+  expect(signedTransaction.sign).not.toHaveBeenCalled();
+  expect(sendTransaction).not.toHaveBeenCalled();
+  expect(confirmTransaction).not.toHaveBeenCalled();
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 describe('shadow mode safety', () => {
@@ -194,6 +280,15 @@ describe('shadow mode safety', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
+    journalFiles.files.clear();
+    journalFiles.roots.clear();
+    for (const directory of readinessDirectories.splice(0)) {
+      const resolved = path.resolve(directory);
+      if (path.dirname(resolved) !== path.resolve(os.tmpdir()) || !path.basename(resolved).startsWith('arbimind-readiness-')) {
+        throw new Error('refusing to remove a directory outside the readiness fixture');
+      }
+      rmSync(resolved, { recursive: true, force: true });
+    }
   });
 
   describe('SOLANA_LOG_ONLY=true', () => {
@@ -261,9 +356,9 @@ describe('shadow mode safety', () => {
   });
 
   describe('pre-execution gates', () => {
-    it('SOLANA_TRADING_ENABLED=false skips before any quote, build or send', async () => {
+    it('trading disabled without LOG_ONLY skips before any quote, build or send', async () => {
       const fetchMock = installFetchMock();
-      const executor = new SolanaExecutor(makeConfig({ tradingEnabled: false }));
+      const executor = new SolanaExecutor(makeConfig({ tradingEnabled: false, logOnly: false }));
 
       const result = await executor.execute(makeOpportunity());
 
@@ -463,7 +558,113 @@ describe('shadow mode safety', () => {
     });
   });
 
+  describe('log-only economics recording (#411)', () => {
+    it('populates expected economics and quote age, leaving realized economics empty', async () => {
+      installFetchMock();
+      const metrics = new SessionMetrics();
+      const executor = new SolanaExecutor(makeConfig({ logOnly: true }), undefined, {
+        gateConfig: PERMISSIVE_GATE,
+        sessionMetrics: metrics,
+      });
+
+      await executor.execute(makeOpportunity());
+
+      const snap = metrics.getShadowSnapshot();
+      // Unreachable before #411: only ever recorded on the sign-and-send path,
+      // which a log-only run never reaches.
+      expect(snap.avgExpectedGrossUsd).not.toBeNull();
+      expect(snap.avgExecutionFeeUsd).not.toBeNull();
+      expect(snap.avgNetEdgeUsd).not.toBeNull();
+      expect(snap.avgNetEdgeBpsOfNotional).not.toBeNull();
+      expect(snap.avgQuoteAgeMs).not.toBeNull();
+
+      // A log-only run has no realized PnL, and that must stay explicit rather
+      // than being silently backfilled from the expected numbers above.
+      expect(snap.realizedTradeCount).toBe(0);
+      expect(snap.avgRealizedGrossUsd).toBeNull();
+      expect(snap.avgRealizedNetEdgeUsd).toBeNull();
+      expect(snap.submitted).toBe(0);
+    });
+
+    /**
+     * The rejects are half the dataset. 16 of Baseline v1's 34 evaluations were
+     * rejections, and their margin is what says whether the strategy is
+     * marginally short or nowhere near — so economics must be recorded for a
+     * REJECTED evaluation too, not only for the ones that pass the gate.
+     */
+    it('records economics for gate-REJECTED evaluations, not just passes', async () => {
+      installFetchMock();
+      const metrics = new SessionMetrics();
+      // Floor far above anything the fixture can produce: guarantees rejection.
+      const executor = new SolanaExecutor(makeConfig({ logOnly: true }), undefined, {
+        gateConfig: { ...PERMISSIVE_GATE, minNetProfitUsd: 100 },
+        sessionMetrics: metrics,
+      });
+
+      const result = await executor.execute(makeOpportunity());
+      expect(result.skipped).toBe(true);
+
+      const snap = metrics.getShadowSnapshot();
+      expect(snap.gateRejected).toBe(1);
+      expect(snap.gatePassed).toBe(0);
+      // Never built or sent — but the economics of the rejection are captured.
+      expect(snap.swapBuildsAttempted).toBe(0);
+      expect(snap.submitted).toBe(0);
+      expect(snap.avgExpectedGrossUsd).not.toBeNull();
+      expect(snap.avgNetEdgeUsd).not.toBeNull();
+      expect(snap.avgQuoteAgeMs).not.toBeNull();
+    });
+
+    /**
+     * Proves the previously-dead "ready for $1 canary" branch is reachable from
+     * a real log-only run, not merely from a hand-built snapshot.
+     *
+     * An injected clock supplies the 30h window. Only journal storage is
+     * virtualized: the real journal performs every read/write/rename, and all
+     * health signals come from the production path. No snapshot fields change.
+     */
+    it('lets a log-only run reach "ready for $1 canary" once enough evaluations accumulate', async () => {
+      const { metrics, journalPath, count } = await healthyReadinessFixture();
+      const snap = metrics.getShadowSnapshot();
+      expect(snap.gateEvaluated).toBeGreaterThanOrEqual(READINESS.minGateEvaluations);
+      expect(snap.avgNetEdgeUsd).not.toBeNull();
+      expect(snap.avgNetEdgeUsd!).toBeGreaterThan(0);
+      expect(snap.submitted).toBe(0);
+
+      expect(snap.sessionDurationSec).toBe(30 * 3600);
+      expectBuildHealth(metrics, count, count, 0);
+      expect(new EconomicsJournal(journalPath).readAll()).toHaveLength(count);
+      expect(snap.readinessHealth.observationPersistence).toEqual({ attempted: count, succeeded: count, failed: 0 });
+      const statistics = calculateEconomicStatistics(snap.economicObservations);
+      expect(statistics.lowerConfidenceBound!).toBeGreaterThanOrEqual(READINESS.minEconomicFloorUsd);
+      const recommendation = deriveRecommendation(snap);
+      expect(recommendation.verdict).toBe('ready for $1 canary');
+      console.info('READINESS_FIXTURE_EVIDENCE', JSON.stringify({ runtime: process.version, hours: snap.sessionDurationSec / 3600, simulation: snap.readinessHealth.simulation, lcb: statistics.lowerConfidenceBound, verdict: recommendation.verdict }));
+    });
+  });
+
   describe('quote failure classification', () => {
+    it('fails closed when SOL/USD pricing is unavailable', async () => {
+      installFetchMock();
+      const metrics = new SessionMetrics();
+      const executor = new SolanaExecutor(makeConfig({ solPriceUsd: 0 }), undefined, {
+        gateConfig: PERMISSIVE_GATE,
+        sessionMetrics: metrics,
+      });
+
+      const result = await executor.execute(makeOpportunity({
+        inputMint: USDC_MINT,
+        outputMint: USDC_MINT,
+        expectedProfitUsd: 1,
+      }));
+
+      expect(result.skipped).toBe(true);
+      const snapshot = metrics.getShadowSnapshot();
+      expect(snapshot.readinessHealth.feeEstimation.unavailable).toBeGreaterThan(0);
+      expect(snapshot.economicObservations.at(-1)?.journal.feeEstimateAvailable).toBe(false);
+      expect(sendTransaction).not.toHaveBeenCalled();
+    });
+
     it('separates rate limiting from other RPC failures', () => {
       expect(classifyQuoteError('Jupiter quote HTTP 429')).toBe('rate_limited');
       expect(classifyQuoteError('Too Many Requests')).toBe('rate_limited');
@@ -491,6 +692,221 @@ describe('shadow mode safety', () => {
       expect(snap.rpc.rateLimited).toBe(1);
       expect(snap.swapBuildsAttempted).toBe(0);
       expect(sendTransaction).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('production fee budget gate/builder equivalence (#412)', () => {
+    it.each([
+      ['current-quote', () => ({ opportunity: makeOpportunity(), resolver: new SolPriceResolver() })],
+      ['fresh-cache', () => {
+        const resolver = new SolPriceResolver();
+        resolver.seedCache(305, Date.now());
+        return { opportunity: makeOpportunity({ inputMint: USDC_MINT, outputMint: USDC_MINT }), resolver };
+      }],
+      ['configured-fallback', () => ({
+        opportunity: makeOpportunity({ inputMint: USDC_MINT, outputMint: USDC_MINT }),
+        resolver: new SolPriceResolver(305),
+      })],
+    ])('uses the production executor fee path for %s price', async (source, makeCase) => {
+      installFetchMock();
+      const { opportunity, resolver } = makeCase();
+      const metrics = new SessionMetrics();
+      const executor = new SolanaExecutor(makeConfig({ logOnly: true }), undefined, {
+        gateConfig: PERMISSIVE_GATE,
+        sessionMetrics: metrics,
+        solPriceResolver: resolver,
+      });
+
+      const result = await executor.execute(opportunity);
+      expect(result.success).toBe(true);
+      const row = metrics.getShadowSnapshot().economicObservations.at(-1)?.journal;
+      expect(row?.feeEstimateAvailable).toBe(true);
+      expect(row?.feeEstimateSource).toBe(source);
+      expect(row?.estimatedFeeLamports).toBeGreaterThan(0);
+      expect(row?.estimatedExecutionFeeUsd).toBeGreaterThan(0);
+    });
+
+    it.each([
+      ['stale-cache', () => {
+        const resolver = new SolPriceResolver();
+        resolver.seedCache(305, Date.now() - 120_000);
+        return resolver;
+      }],
+      ['unavailable', () => new SolPriceResolver()],
+    ])('blocks the production gate for %s price', async (_source, createResolver) => {
+      installFetchMock();
+      const metrics = new SessionMetrics();
+      const executor = new SolanaExecutor(makeConfig({ logOnly: true }), undefined, {
+        gateConfig: PERMISSIVE_GATE,
+        sessionMetrics: metrics,
+        solPriceResolver: createResolver(),
+      });
+
+      const result = await executor.execute(makeOpportunity({ inputMint: USDC_MINT, outputMint: USDC_MINT }));
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain('fee_estimate_unavailable');
+      const row = metrics.getShadowSnapshot().economicObservations.at(-1)?.journal;
+      expect(row?.feeEstimateAvailable).toBe(false);
+      expect(row?.passed).toBe(false);
+      expect(row?.estimatedExecutionFeeUsd).toBeNull();
+    });
+
+    it('propagates a configured priority-fee spike into gate economics and the builder', async () => {
+      const builderFees: number[] = [];
+      const fetchMock = vi.fn(async (input: unknown, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes('/quote')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              outAmount: '3050000',
+              inAmount: '10000000',
+              outputMint: USDC_MINT,
+              priceImpactPct: '0.01',
+              routePlan: [{ percent: 100, swapInfo: { ammKey: 'pool-a', label: 'Whirlpool' } }],
+            }),
+          };
+        }
+        if (url.includes('/swap')) {
+          builderFees.push(Number((JSON.parse(String(init?.body)) as Record<string, unknown>).prioritizationFeeLamports));
+          return { ok: true, status: 200, json: async () => ({ swapTransaction: Buffer.from('fake-tx').toString('base64') }) };
+        }
+        return { ok: false, status: 404, json: async () => ({}) };
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const normalMetrics = new SessionMetrics();
+      const spikeMetrics = new SessionMetrics();
+      await new SolanaExecutor(makeConfig({ logOnly: true, priorityFeeMicroLamports: 1_000 }), undefined, {
+        gateConfig: PERMISSIVE_GATE,
+        sessionMetrics: normalMetrics,
+      }).execute(makeOpportunity());
+      await new SolanaExecutor(makeConfig({ logOnly: true, priorityFeeMicroLamports: 100_000 }), undefined, {
+        gateConfig: PERMISSIVE_GATE,
+        sessionMetrics: spikeMetrics,
+      }).execute(makeOpportunity());
+
+      const normal = normalMetrics.getShadowSnapshot().economicObservations.at(-1)?.journal;
+      const spike = spikeMetrics.getShadowSnapshot().economicObservations.at(-1)?.journal;
+      expect(spike?.estimatedFeeLamports).toBeGreaterThan(normal?.estimatedFeeLamports ?? 0);
+      expect(spike?.estimatedExecutionFeeUsd).toBeGreaterThan(normal?.estimatedExecutionFeeUsd ?? 0);
+      expect(builderFees[1]).toBeGreaterThan(builderFees[0]);
+    });
+
+    it('passes one fee budget from the gate to the real swap builder', async () => {
+      let swapBody: Record<string, unknown> | null = null;
+      const fetchMock = vi.fn(async (input: unknown, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes('/quote')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              outAmount: '3050000',
+              inAmount: '10000000',
+              outputMint: USDC_MINT,
+              priceImpactPct: '0.01',
+              routePlan: [{ percent: 100, swapInfo: { ammKey: 'pool-a', label: 'Whirlpool' } }],
+            }),
+          };
+        }
+        if (url.includes('/swap')) {
+          swapBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ swapTransaction: Buffer.from('fake-tx').toString('base64') }),
+          };
+        }
+        return { ok: false, status: 404, json: async () => ({}) };
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const directory = mkdtempSync(path.join(os.tmpdir(), 'arbimind-fee-budget-'));
+      try {
+        const metrics = new SessionMetrics({ economicsJournalPath: path.join(directory, 'economics.jsonl') });
+        const executor = new SolanaExecutor(makeConfig({ computeUnitLimit: 200_000, priorityFeeMicroLamports: 1_000, logOnly: true }), undefined, {
+          gateConfig: PERMISSIVE_GATE,
+          sessionMetrics: metrics,
+        });
+
+        const result = await executor.execute(makeOpportunity());
+        expect(result.success).toBe(true);
+        expect(swapBody).not.toBeNull();
+        expect(swapBody?.['computeUnitLimit']).toBe(200_000);
+        expect(swapBody?.['prioritizationFeeLamports']).toBe(10_000);
+
+        const row = metrics.getShadowSnapshot().economicObservations.at(-1)?.journal;
+        expect(row?.feeEstimateAvailable).toBe(true);
+        expect(row?.estimatedExecutionFeeUsd).toBeGreaterThan(0);
+        expect(row?.estimatedExecutionFeeUsd).toBeCloseTo((15_000 / 1e9) * 305, 8);
+        expect(row?.estimatedExecutionFeeUsd).toBeGreaterThan(0);
+        expect(row?.estimatedExecutionFeeUsd).not.toBe(0);
+        // The builder's priority fee is the same estimated priority component
+        // recorded by the gate budget; changing either side must fail this test.
+        expect(swapBody?.['prioritizationFeeLamports']).toBe(
+          row!.estimatedFeeLamports! - 5_000,
+        );
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('swap build failure and simulation health propagation (#413)', () => {
+    it('records Jupiter simulationError as a build failure and blocks readiness', async () => {
+      const { metrics, executor, fetchMock } = await healthyReadinessFixture();
+      replaceSwapResponse(fetchMock, async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ simulationError: 'InstructionError(0, Custom(6001))' }),
+      }));
+
+      const result = await executor.execute(makeOpportunity());
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Jupiter swap simulation failed');
+
+      const count = READINESS.minGateEvaluations + 5 + 1;
+      expectBuildHealth(metrics, count, count - 1, 1);
+      const recommendation = deriveRecommendation(metrics.getShadowSnapshot());
+      expect(recommendation.verdict).toBe('not ready');
+      expect(recommendation.reasons).toContain('quote/build/simulation failures were recorded');
+    });
+
+    it('records missing swapTransaction as a build failure and blocks readiness', async () => {
+      const { metrics, executor, fetchMock } = await healthyReadinessFixture();
+      replaceSwapResponse(fetchMock, async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ swapTransaction: '' }),
+      }));
+
+      const result = await executor.execute(makeOpportunity());
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('missing swapTransaction');
+
+      const count = READINESS.minGateEvaluations + 5 + 1;
+      expectBuildHealth(metrics, count, count - 1, 1);
+      const recommendation = deriveRecommendation(metrics.getShadowSnapshot());
+      expect(recommendation.verdict).toBe('not ready');
+      expect(recommendation.reasons).toContain('quote/build/simulation failures were recorded');
+    });
+
+    it('records builder network throw as a build failure and blocks readiness', async () => {
+      const { metrics, executor, fetchMock } = await healthyReadinessFixture();
+      replaceSwapResponse(fetchMock, async () => {
+        throw new Error('ECONNRESET while posting to Jupiter /swap');
+      });
+
+      const result = await executor.execute(makeOpportunity());
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('ECONNRESET');
+
+      const count = READINESS.minGateEvaluations + 5 + 1;
+      expectBuildHealth(metrics, count, count - 1, 1);
+      const recommendation = deriveRecommendation(metrics.getShadowSnapshot());
+      expect(recommendation.verdict).toBe('not ready');
+      expect(recommendation.reasons).toContain('quote/build/simulation failures were recorded');
     });
   });
 });

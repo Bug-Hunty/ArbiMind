@@ -5,8 +5,9 @@
  * DEVNET ONLY — never touches mainnet execution paths.
  */
 
+import bs58 from 'bs58';
 import { Connection, Keypair, LAMPORTS_PER_SOL, VersionedTransaction } from '@solana/web3.js';
-import { parseTreasuryDiagnostics, getConnection } from '../routes/solanaTx';
+import { getConnection } from '../routes/solanaTx';
 import {
   type ArbitrageOpportunity,
   type LogEntry,
@@ -36,6 +37,27 @@ let isExecuting = false;
 let resolvedKeypair: Keypair | null = null;
 let keypairSource: string | null = null;
 
+export function resolveTradingKeypairFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): { keypair: Keypair; source: 'SOLANA_TRADING_PRIVATE_KEY_BASE58' } {
+  const tradingRaw = env.SOLANA_TRADING_PRIVATE_KEY_BASE58?.trim();
+  if (!tradingRaw) {
+    throw new Error('[EXECUTOR] No trading keypair configured');
+  }
+  try {
+    const bytes = Uint8Array.from(bs58.decode(tradingRaw));
+    if (bytes.length === 64) {
+      return { keypair: Keypair.fromSecretKey(bytes), source: 'SOLANA_TRADING_PRIVATE_KEY_BASE58' };
+    }
+    if (bytes.length === 32) {
+      return { keypair: Keypair.fromSeed(bytes), source: 'SOLANA_TRADING_PRIVATE_KEY_BASE58' };
+    }
+  } catch {
+    // Fall through to the redacted validation error below.
+  }
+  throw new Error('[EXECUTOR] Trading keypair is invalid');
+}
+
 export interface TradeRecord {
   id: string;
   oppId: string;
@@ -60,44 +82,23 @@ const MAX_HISTORY = 200;
 // ---------------------------------------------------------------------------
 
 /**
- * Initialize executor: resolve keypair from env vars.
- * Priority: SOLANA_TREASURY_SECRET_KEY → TREASURY_PRIVATE_KEY
- * Throws if neither is configured.
+ * Initialize executor from the explicit trading signer only. Treasury
+ * credentials belong to withdrawal/admin routes and cannot authorize trading.
  */
 export function initializeExecutor(): void {
   if (resolvedKeypair) return; // already initialized
 
-  const hasPrimary = !!process.env.SOLANA_TREASURY_SECRET_KEY?.trim();
-  const hasFallback = !!process.env.TREASURY_PRIVATE_KEY?.trim();
-
-  // Alias TREASURY_PRIVATE_KEY so parseTreasuryDiagnostics can parse it
-  if (!hasPrimary && hasFallback) {
-    process.env.SOLANA_TREASURY_SECRET_KEY = process.env.TREASURY_PRIVATE_KEY;
-  }
-
-  if (!hasPrimary && !hasFallback) {
-    throw new Error(
-      '[EXECUTOR] No keypair configured \u2014 set SOLANA_TREASURY_SECRET_KEY or TREASURY_PRIVATE_KEY'
-    );
-  }
-
-  const diag = parseTreasuryDiagnostics();
-  if (!diag.configured || !diag.keypair) {
-    throw new Error(
-      '[EXECUTOR] Keypair env var found but failed to parse \u2014 check key format'
-    );
-  }
-
-  resolvedKeypair = diag.keypair;
-  keypairSource = hasPrimary ? 'SOLANA_TREASURY_SECRET_KEY' : 'TREASURY_PRIVATE_KEY';
+  const resolved = resolveTradingKeypairFromEnv();
+  resolvedKeypair = resolved.keypair;
+  keypairSource = resolved.source;
   addLog('info', `[EXECUTOR] Keypair loaded from ${keypairSource}`);
 }
 
 function getKeypairOrThrow(): Keypair {
   if (resolvedKeypair) return resolvedKeypair;
   // Fallback for pre-init calls
-  const diag = parseTreasuryDiagnostics();
-  if (diag.configured && diag.keypair) return diag.keypair;
+  initializeExecutor();
+  if (resolvedKeypair) return resolvedKeypair;
   throw new Error('[EXECUTOR] No keypair available \u2014 call initializeExecutor first');
 }
 
@@ -105,11 +106,14 @@ function getKeypairAndAddress(): { keypair: Keypair; address: string } | null {
   if (resolvedKeypair) {
     return { keypair: resolvedKeypair, address: resolvedKeypair.publicKey.toBase58() };
   }
-  const diag = parseTreasuryDiagnostics();
-  if (diag.configured && diag.keypair) {
-    return { keypair: diag.keypair, address: diag.keypair.publicKey.toBase58() };
+  try {
+    const resolved = resolveTradingKeypairFromEnv();
+    resolvedKeypair = resolved.keypair;
+    keypairSource = resolved.source;
+    return { keypair: resolved.keypair, address: resolved.keypair.publicKey.toBase58() };
+  } catch {
+    return null;
   }
-  return null;
 }
 
 // ---------------------------------------------------------------------------

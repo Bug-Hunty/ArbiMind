@@ -8,7 +8,10 @@ describe('getEligibleDexesForPair', () => {
   });
 
   afterEach(() => {
-    process.env = { ...originalEnv };
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) delete process.env[key];
+    }
+    Object.assign(process.env, originalEnv);
     delete process.env['PAIR_DEX_OVERRIDE'];
   });
 

@@ -165,6 +165,7 @@ describe('AI scoring metrics', () => {
 describe('readiness treats an unscored run as not ready', () => {
   const base = () => {
     const s = new SessionMetrics().getShadowSnapshot();
+    const now = Date.now();
     return {
       ...s,
       sessionDurationSec: 30 * 3600,
@@ -174,6 +175,21 @@ describe('readiness treats an unscored run as not ready', () => {
       swapBuildsAttempted: 100,
       swapsBuilt: 100,
       avgNetEdgeUsd: 0.15,
+      economicObservations: Array.from({ length: 500 }, (_, index) => ({
+        timestampMs: now - 25 * 60 * 60 * 1000 + index * (25 * 60 * 60 * 1000 / 499),
+        netExpectedUsd: 0.15,
+        usable: true,
+        passed: true,
+      })),
+      readinessHealth: {
+        feeEstimation: { attempted: 500, available: 500, unavailable: 0 },
+        poolResolution: { configured: 5, resolved: 5, unresolved: 0 },
+        observationPersistence: { attempted: 500, succeeded: 500, failed: 0 },
+        simulation: { attempted: 100, succeeded: 100, failed: 0 },
+        sourceSha: 'test-sha',
+        runtimeSha: 'test-sha',
+        requiredSafetyConfiguration: true,
+      },
     };
   };
 

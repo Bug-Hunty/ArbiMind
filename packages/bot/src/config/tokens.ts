@@ -1,4 +1,5 @@
 import { getAddress } from 'ethers';
+import { readEvmSubsystemState } from './subsystems';
 
 export interface TokenConfig {
   address: string;
@@ -248,6 +249,7 @@ function validateTokenAddresses(tokens: Record<string, TokenConfig>, label: stri
 }
 
 function resolveTokens(): Record<string, TokenConfig> {
+  if (!readEvmSubsystemState().enabled) return {};
   if (isArbitrumProfile()) return validateTokenAddresses(ARBITRUM_ALLOWLISTED_TOKENS, 'Arbitrum');
   if (isEthereumSepoliaProfile()) return validateTokenAddresses(buildSepoliaTokens(), 'Sepolia');
   return validateTokenAddresses(DEFAULT_ALLOWLISTED_TOKENS, 'Ethereum');
@@ -255,7 +257,7 @@ function resolveTokens(): Record<string, TokenConfig> {
 
 export const ALLOWLISTED_TOKENS: Record<string, TokenConfig> = resolveTokens();
 
-export const TOKEN_PAIRS = buildTokenPairs(ALLOWLISTED_TOKENS);
+export const TOKEN_PAIRS = readEvmSubsystemState().enabled ? buildTokenPairs(ALLOWLISTED_TOKENS) : [];
 
 /** Sepolia pairs (symbols only). Use at runtime so scan never gets 0 pairs when env is set. */
 export function getSepoliaPairs(): Array<{ tokenA: string; tokenB: string }> {
