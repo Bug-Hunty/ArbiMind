@@ -291,6 +291,101 @@ describe('shadow mode safety', () => {
     }
   });
 
+  /**
+   * What LOG_ONLY actually does against the live API today.
+   *
+   * The real log-only build identity is `shadowBuildPublicKey()` — unfunded,
+   * with no token accounts — so Jupiter builds the transaction and reports a
+   * failed simulation. Measured 60/60 against the live API:
+   *
+   *   simulationError: { errorCode: "TRANSACTION_ERROR",
+   *                      error: "Attempt to debit an account but found no
+   *                              record of a prior credit." }
+   *
+   * The executor then rejects the build and never reaches the log-only return.
+   * This block asserts that the safety guarantees hold on THAT path too, not
+   * only on the funded-identity path the shared fixture models.
+   */
+  describe('real unfunded shadow identity', () => {
+    function installUnfundedShadowFetchMock(): void {
+      vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+        const url = String(input);
+        if (url.includes('/quote')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              inAmount: '10000000',
+              outAmount: '3050000',
+              otherAmountThreshold: '3040000',
+              priceImpactPct: '0.01',
+              inputMint: SOL_MINT,
+              outputMint: USDC_MINT,
+              routePlan: [
+                { percent: 100, swapInfo: { ammKey: 'pool1', label: 'Whirlpool', inputMint: SOL_MINT, outputMint: USDC_MINT } },
+              ],
+            }),
+          };
+        }
+        if (url.includes('/swap')) {
+          // Jupiter builds the transaction AND reports the failed simulation.
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              swapTransaction: Buffer.from('fake-tx').toString('base64'),
+              simulationError: {
+                errorCode: 'TRANSACTION_ERROR',
+                error: 'Attempt to debit an account but found no record of a prior credit.',
+              },
+            }),
+          };
+        }
+        return { ok: false, status: 404, json: async () => ({}) };
+      }));
+    }
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it('surfaces simulationError as a build failure and never signs or sends', async () => {
+      installUnfundedShadowFetchMock();
+      const metrics = new SessionMetrics();
+      const executor = new SolanaExecutor(makeConfig({ logOnly: true }), undefined, {
+        gateConfig: PERMISSIVE_GATE,
+        sessionMetrics: metrics,
+      });
+
+      const result = await executor.execute(makeOpportunity());
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('simulation failed');
+      expect(result.logOnly).toBeUndefined();
+
+      // Signing-ready is never reached, so nothing downstream may run.
+      expect(signedTransaction.sign).not.toHaveBeenCalled();
+      expect(sendTransaction).not.toHaveBeenCalled();
+      expect(confirmTransaction).not.toHaveBeenCalled();
+
+      const snap = metrics.getShadowSnapshot();
+      expect(snap.gatePassed).toBe(1);
+      expect(snap.swapBuildsAttempted).toBe(1);
+      // The build did NOT complete: a shadow report must not imply otherwise.
+      expect(snap.swapsBuilt).toBe(0);
+      expect(snap.submitted).toBe(0);
+    });
+  });
+
+  /**
+   * FIDELITY NOTE. The shared fetch mock used below returns a /swap response
+   * with no `simulationError`, which models a FUNDED build identity — not the
+   * unfunded shadow key the block above covers.
+   *
+   * These tests therefore assert a conditional property: IF the build
+   * succeeds, log-only stops before send. That is worth keeping, and it is not
+   * a claim that shadow mode reaches the log-only return today.
+   */
   describe('SOLANA_LOG_ONLY=true', () => {
     it('builds a swap transaction but never calls sendTransaction', async () => {
       installFetchMock();
