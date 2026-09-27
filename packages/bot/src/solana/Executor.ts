@@ -966,6 +966,11 @@ export class SolanaExecutor {
     url.searchParams.set('amount', String(opportunity.amountLamports));
     url.searchParams.set('slippageBps', String(this.config.maxSlippageBps));
     url.searchParams.set('onlyDirectRoutes', String(this.config.onlyDirectRoutes));
+    // Must match the /swap request body. Jupiter rejects a legacy swap built
+    // from a quote carrying transactionVersion:
+    //   "asLegacyTransaction cannot be used with quoteResponse.transactionVersion"
+    // so the flag has to be set on the quote as well, not only on the build.
+    url.searchParams.set('asLegacyTransaction', String(this.config.asLegacyTransaction));
 
     const response = await fetch(url.toString());
     if (!response.ok) {
