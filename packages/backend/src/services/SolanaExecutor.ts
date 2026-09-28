@@ -132,7 +132,7 @@ export async function validateBeforeExecute(
   // Check wallet balance
   const resolved = getKeypairAndAddress();
   if (!resolved) {
-    return { valid: false, reason: 'Treasury keypair not configured' };
+    return { valid: false, reason: 'Explicit trading signer not initialized' };
   }
 
   const conn = getConnection('devnet');
@@ -381,6 +381,7 @@ export function getBotMode(): BotMode {
 }
 
 export function setBotMode(mode: BotMode): void {
+  if (mode === 'live') initializeExecutor();
   botMode = mode;
 }
 

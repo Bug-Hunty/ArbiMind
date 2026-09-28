@@ -6,6 +6,9 @@ export default defineConfig({
     environment: 'node',
     globals: true,
     testTimeout: 20000,
+    // Bound concurrent module loading and compiler subprocesses on developer
+    // machines; isolated workers still exercise environment-sensitive tests.
+    maxWorkers: 4,
     coverage: {
       provider: 'v8',
       reporter: ['text', 'lcov', 'json', 'html'],
